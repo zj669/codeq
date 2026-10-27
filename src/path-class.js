@@ -109,15 +109,19 @@ export function pathTier(filePath) {
 }
 
 export const CALLER_TIER_PRODUCTION = 0;
-export const CALLER_TIER_CONFIG = 1;
-export const CALLER_TIER_TEST = 2;
-export const CALLER_TIER_BENCH = 3;
-export const CALLER_TIER_DOCS = 4;
+export const CALLER_TIER_TEST = 1;
+export const CALLER_TIER_BENCH = 2;
+export const CALLER_TIER_DOCS = 3;
+export const CALLER_TIER_CONFIG = 4;
 
 // Caller ranking needs a finer split than pathTier: a giant library symbol is
 // called from hundreds of tests, and a handful of benchmark *helpers* sorted
 // alphabetically would otherwise fill every visible slot and push the real
-// callers into the omitted count.
+// callers into the omitted count. Config lands last, below docs: a docs
+// snippet still demonstrates a call, while a config-tier hit is a CI mention
+// or a generated dist/coverage copy of a caller already listed. pathTier
+// keeps config above tests instead, because config files are legitimate
+// find/grep targets in a way caller noise never is.
 export function callerTier(filePath) {
   if (isDocsPath(filePath)) return CALLER_TIER_DOCS;
   if (isBenchPath(filePath)) return CALLER_TIER_BENCH;

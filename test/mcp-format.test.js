@@ -989,7 +989,7 @@ test("graph caller cap keeps production callers before tests", () => {
 // A library symbol is called from hundreds of tests; alphabetical order used to
 // hand every visible slot to tests/benchmarks/* helpers while the production
 // caller sat in the omitted count.
-test("graph caller ranking puts production first, then tests, then benchmarks, then docs", () => {
+test("graph caller ranking puts production first, then tests, then benchmarks, then docs, then config", () => {
   const formatted = formatMcpToolResult("graph", {
     ...graphResult,
     symbols: [
@@ -1004,6 +1004,8 @@ test("graph caller ranking puts production first, then tests, then benchmarks, t
           { name: "benchHelper", path: "tests/benchmarks/utils.py", line: 11, endLine: 46 },
           { name: "memBench", path: "tests/memory_benchmarks/test_graph.py", line: 21, endLine: 72 },
           { name: "docSample", path: "docs/tutorial/intro.py", line: 3, endLine: 9 },
+          { name: "ciMention", path: ".github/workflows/ci.yml", line: 5, endLine: 5 },
+          { name: "bundleCopy", path: "dist/bundle.js", line: 900, endLine: 901 },
           { name: "testMultiplePath", path: "tests/test_annotated.py", line: 77, endLine: 100 },
           { name: "boot", path: "src/main.ts", line: 8, endLine: 12 },
         ],
@@ -1014,9 +1016,40 @@ test("graph caller ranking puts production first, then tests, then benchmarks, t
     formatted.structuredContent.callers.map((caller) => caller.name),
     ["boot", "testMultiplePath", "benchHelper", "memBench"],
   );
-  // The docs caller is the one pushed out, not the production caller.
-  assert.match(formatted.text, /\+1 callers omitted/);
+  // The docs and config callers are pushed out, not the production caller.
+  assert.match(formatted.text, /\+3 callers omitted/);
   assert.equal(formatted.text.includes("docSample"), false);
+  assert.equal(formatted.text.includes("ciMention"), false);
+  assert.equal(formatted.text.includes("bundleCopy"), false);
+});
+
+// With fewer callers than the cap, the full tier order is still visible:
+// production, test, bench, docs, then config/generated.
+test("graph caller ranking shows config callers last when under the cap", () => {
+  const formatted = formatMcpToolResult("graph", {
+    ...graphResult,
+    symbols: [
+      {
+        name: "createSession",
+        kind: "function",
+        path: "src/session.ts",
+        startLine: 12,
+        endLine: 40,
+        callees: [],
+        callers: [
+          { name: "ciMention", path: ".github/workflows/ci.yml", line: 5, endLine: 5 },
+          { name: "docSample", path: "docs/tutorial/intro.py", line: 3, endLine: 9 },
+          { name: "boot", path: "src/main.ts", line: 8, endLine: 12 },
+          { name: "spec", path: "test/session.test.ts", line: 4, endLine: 8 },
+        ],
+      },
+    ],
+  });
+  assert.deepEqual(
+    formatted.structuredContent.callers.map((caller) => caller.name),
+    ["boot", "spec", "docSample", "ciMention"],
+  );
+  assert.equal(formatted.text.includes("callers omitted"), false);
 });
 
 // The reply tells the agent to pass path: when callers are omitted, so path:

@@ -14,6 +14,7 @@ import {
 import { isTestPath } from "../src/graph-map.js";
 import {
   CALLER_TIER_BENCH,
+  CALLER_TIER_CONFIG,
   CALLER_TIER_DOCS,
   CALLER_TIER_PRODUCTION,
   CALLER_TIER_TEST,
@@ -158,7 +159,7 @@ test("isBenchPath only refines paths that are already non-production", () => {
   assert.equal(isBenchPath("fastapi/applications.py"), false);
 });
 
-test("callerTier ranks production ahead of tests, benchmarks, docs and examples", () => {
+test("callerTier ranks production ahead of tests, benchmarks, docs and config", () => {
   assert.equal(callerTier("fastapi/applications.py"), CALLER_TIER_PRODUCTION);
   assert.equal(callerTier("src/main.ts"), CALLER_TIER_PRODUCTION);
   assert.equal(callerTier("tests/test_annotated.py"), CALLER_TIER_TEST);
@@ -169,12 +170,18 @@ test("callerTier ranks production ahead of tests, benchmarks, docs and examples"
   );
   assert.equal(callerTier("docs/tutorial/intro.py"), CALLER_TIER_DOCS);
   assert.equal(callerTier("examples/app.py"), CALLER_TIER_DOCS);
+  assert.equal(callerTier(".github/workflows/ci.yml"), CALLER_TIER_CONFIG);
+  assert.equal(callerTier("dist/async.js"), CALLER_TIER_CONFIG);
+  assert.equal(callerTier("coverage/lcov.info"), CALLER_TIER_CONFIG);
+  assert.equal(callerTier("eslint.config.js"), CALLER_TIER_CONFIG);
   // Production strictly precedes every noise tier.
   for (const noisy of [
     "tests/test_annotated.py",
     "tests/benchmarks/utils.py",
     "docs/tutorial/intro.py",
     "examples/app.py",
+    ".github/workflows/ci.yml",
+    "dist/async.js",
   ]) {
     assert.ok(callerTier("fastapi/applications.py") < callerTier(noisy), noisy);
   }
@@ -183,6 +190,18 @@ test("callerTier ranks production ahead of tests, benchmarks, docs and examples"
     callerTier("tests/test_annotated.py") <
       callerTier("tests/benchmarks/utils.py"),
   );
+  // Config/generated callers are the bottom tier: a docs snippet still
+  // demonstrates a call, a CI mention or a dist copy does not.
+  for (const config of [
+    ".github/workflows/ci.yml",
+    "dist/async.js",
+    "eslint.config.js",
+  ]) {
+    assert.ok(
+      callerTier("docs/tutorial/intro.py") < callerTier(config),
+      config,
+    );
+  }
 });
 
 test("pathTier demotes docs more than tests, production is 0", () => {
