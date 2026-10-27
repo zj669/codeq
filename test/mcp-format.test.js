@@ -16,6 +16,7 @@ import {
   GRAPH_LOCATED,
 } from "../src/mcp-format.js";
 import { parseExploreDump, queryIdentifiers } from "../src/graph-map.js";
+import { GIANT_SPAN_LINES, MEMBER_CAP } from "../src/limits.js";
 
 test("grep regex must be a boolean; omit is not a literal default", () => {
   assert.equal(requireGrepRegex(true), true);
@@ -31,7 +32,8 @@ test("grep regex must be a boolean; omit is not a literal default", () => {
 
 const stale = {
   status: "degraded",
-  warning: "FFF watcher is not covering this root",
+  fffWarning: "FFF watcher is not covering this root",
+  graphWarning: null,
   lastSuccessfulSync: "2026-09-21T10:00:00.000Z",
   root: "/repo",
   rootSource: "cwd",
@@ -78,7 +80,8 @@ function exploreDump(files = 2) {
 const graphResult = {
   ...stale,
   status: "ready",
-  warning: null,
+  fffWarning: null,
+  graphWarning: null,
   query: "how does createSession work",
   result: exploreDump(),
   symbols: [
@@ -981,6 +984,217 @@ test("graph caller cap keeps production callers before tests", () => {
   );
   assert.match(formatted.text, /\+1 callers omitted/);
   assert.equal(formatted.text.includes("specC"), false);
+});
+
+// A library symbol is called from hundreds of tests; alphabetical order used to
+// hand every visible slot to tests/benchmarks/* helpers while the production
+// caller sat in the omitted count.
+test("graph caller ranking puts production first, then tests, then benchmarks, then docs", () => {
+  const formatted = formatMcpToolResult("graph", {
+    ...graphResult,
+    symbols: [
+      {
+        name: "createSession",
+        kind: "function",
+        path: "src/session.ts",
+        startLine: 12,
+        endLine: 40,
+        callees: [],
+        callers: [
+          { name: "benchHelper", path: "tests/benchmarks/utils.py", line: 11, endLine: 46 },
+          { name: "memBench", path: "tests/memory_benchmarks/test_graph.py", line: 21, endLine: 72 },
+          { name: "docSample", path: "docs/tutorial/intro.py", line: 3, endLine: 9 },
+          { name: "testMultiplePath", path: "tests/test_annotated.py", line: 77, endLine: 100 },
+          { name: "boot", path: "src/main.ts", line: 8, endLine: 12 },
+        ],
+      },
+    ],
+  });
+  assert.deepEqual(
+    formatted.structuredContent.callers.map((caller) => caller.name),
+    ["boot", "testMultiplePath", "benchHelper", "memBench"],
+  );
+  // The docs caller is the one pushed out, not the production caller.
+  assert.match(formatted.text, /\+1 callers omitted/);
+  assert.equal(formatted.text.includes("docSample"), false);
+});
+
+// The reply tells the agent to pass path: when callers are omitted, so path:
+// has to actually shrink the caller list.
+test("a path constraint narrows callers and the omitted count follows it", () => {
+  const symbols = [
+    {
+      name: "createSession",
+      kind: "function",
+      path: "src/session.ts",
+      startLine: 12,
+      endLine: 40,
+      callees: [],
+      callers: [
+        { name: "boot", path: "src/main.ts", line: 8, endLine: 12 },
+        { name: "wire", path: "src/wire.ts", line: 4, endLine: 6 },
+        { name: "specA", path: "test/a.test.ts", line: 1, endLine: 2 },
+        { name: "specB", path: "test/b.test.ts", line: 1, endLine: 2 },
+        { name: "specC", path: "test/c.test.ts", line: 1, endLine: 2 },
+      ],
+    },
+  ];
+  const wide = formatMcpToolResult("graph", { ...graphResult, symbols });
+  assert.match(wide.text, /\+1 callers omitted/);
+
+  // path: scopes the entry too, so it narrows callers only at or above the
+  // definition's own directory — src/ here, which drops the three test callers.
+  const scoped = formatMcpToolResult("graph", {
+    ...graphResult,
+    symbols,
+    constraint: "src",
+  });
+  assert.deepEqual(
+    scoped.structuredContent.callers.map((caller) => caller.name),
+    ["boot", "wire"],
+  );
+  // Two callers are in scope and the cap is four, so nothing is omitted.
+  assert.equal(scoped.text.includes("callers omitted"), false);
+  assert.equal(scoped.text.includes("specA"), false);
+});
+
+const giantClass = {
+  name: "FastAPI",
+  kind: "class",
+  path: "fastapi/applications.py",
+  startLine: 52,
+  endLine: 4816,
+  callees: [],
+  callers: [],
+  members: [
+    { name: "__init__", path: "fastapi/applications.py", line: 68, endLine: 1030, callerCount: 0 },
+    { name: "build_middleware_stack", path: "fastapi/applications.py", line: 1032, endLine: 1083, callerCount: 1 },
+    { name: "openapi", path: "fastapi/applications.py", line: 1085, endLine: 1118, callerCount: 192 },
+    { name: "setup", path: "fastapi/applications.py", line: 1120, endLine: 1173, callerCount: 1 },
+    // Nested inside setup: describes setup's body, not a way into the class.
+    { name: "swagger_ui_html", path: "fastapi/applications.py", line: 1138, endLine: 1150, callerCount: 0 },
+    { name: "include_router", path: "fastapi/applications.py", line: 1483, endLine: 1686, callerCount: 125 },
+    { name: "get", path: "fastapi/applications.py", line: 1688, endLine: 2059, callerCount: 27 },
+    { name: "post", path: "fastapi/applications.py", line: 2439, endLine: 2815, callerCount: 564 },
+  ],
+};
+
+test("giant definition is never presented as a single whole-span read", () => {
+  const formatted = formatMcpToolResult("graph", {
+    ...graphResult,
+    query: "FastAPI",
+    symbols: [giantClass],
+  });
+  const [entry] = formatted.structuredContent.entries;
+
+  // The presented span is the head, not the 4765-line body.
+  assert.equal(entry.startLine, 52);
+  assert.equal(entry.endLine, 67);
+  assert.equal(entry.spanCapped, true);
+  assert.equal(entry.definitionEndLine, 4816);
+  assert.equal(entry.definitionLines, 4765);
+  assert.equal(formatted.text.includes("52-4816 FastAPI"), false);
+  assert.match(formatted.text, /fastapi\/applications\.py:52-67 FastAPI/);
+  assert.match(formatted.text, /too big to read; use the entry points below/);
+
+  // The body is reached through method locators, most-called first, and the
+  // nested helper inside setup() is not offered as an entry point.
+  assert.deepEqual(
+    formatted.structuredContent.members.map((member) => member.name),
+    ["post", "openapi", "include_router", "get", "build_middleware_stack", "setup"],
+  );
+  assert.match(formatted.text, /fastapi\/applications\.py:2439-2815 post/);
+  assert.equal(formatted.text.includes("swagger_ui_html"), false);
+  assert.match(formatted.text, /\+1 methods omitted/);
+});
+
+test("giant-definition omitted count covers exactly the unshown top-level methods", () => {
+  const members = [];
+  for (let index = 0; index < 30; index += 1) {
+    members.push({
+      name: `method${index}`,
+      path: "src/huge.ts",
+      line: 20 + index * 10,
+      endLine: 28 + index * 10,
+      callerCount: 30 - index,
+    });
+  }
+  const formatted = formatMcpToolResult("graph", {
+    ...graphResult,
+    query: "Huge",
+    symbols: [
+      {
+        name: "Huge",
+        kind: "class",
+        path: "src/huge.ts",
+        startLine: 10,
+        endLine: 900,
+        callees: [],
+        callers: [],
+        members,
+      },
+    ],
+  });
+  const shown = formatted.structuredContent.members.length;
+  assert.equal(shown, MEMBER_CAP);
+  assert.match(formatted.text, new RegExp(`\\+${members.length - shown} methods omitted`));
+  assert.equal(formatted.structuredContent.truncated, true);
+  assert.match(formatted.text, /graph one of the names above/);
+});
+
+// A long function has no methods to offer, so the note must not promise entry
+// points that are not there.
+test("a giant definition with no members is capped without promising entry points", () => {
+  const formatted = formatMcpToolResult("graph", {
+    ...graphResult,
+    query: "include_router",
+    symbols: [
+      {
+        name: "include_router",
+        kind: "method",
+        path: "fastapi/applications.py",
+        startLine: 1483,
+        endLine: 1686,
+        callees: [],
+        callers: [],
+        members: [],
+      },
+    ],
+  });
+  const [entry] = formatted.structuredContent.entries;
+  assert.equal(entry.spanCapped, true);
+  assert.equal(entry.definitionEndLine, 1686);
+  assert.equal(formatted.text.includes("1483-1686 include_router"), false);
+  assert.equal(formatted.text.includes("entry points"), false);
+  assert.match(formatted.text, /too big to read whole; the span above is its head/);
+  assert.deepEqual(formatted.structuredContent.members, []);
+});
+
+test("a definition at or under the giant threshold keeps its whole span", () => {
+  const formatted = formatMcpToolResult("graph", {
+    ...graphResult,
+    query: "Small",
+    symbols: [
+      {
+        name: "Small",
+        kind: "class",
+        path: "src/small.ts",
+        startLine: 1,
+        endLine: GIANT_SPAN_LINES,
+        callees: [],
+        callers: [],
+        members: [
+          { name: "run", path: "src/small.ts", line: 4, endLine: 9, callerCount: 3 },
+        ],
+      },
+    ],
+  });
+  const [entry] = formatted.structuredContent.entries;
+  assert.equal(entry.endLine, GIANT_SPAN_LINES);
+  assert.equal(entry.spanCapped, undefined);
+  assert.deepEqual(formatted.structuredContent.members, []);
+  assert.equal(formatted.text.includes("entry points"), false);
+  assert.equal(formatted.text.includes("too big to read"), false);
 });
 
 test("literal grep with unescaped | or groups hints regex:true and stays 0 hits", () => {

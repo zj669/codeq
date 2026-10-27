@@ -24,8 +24,15 @@ function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
+// The index may belong to another worktree with identical content. codeq only
+// points us there while that is true, and owns the invalidation, so this
+// process must only read: no sync pass, no watcher, no second writer.
+const shared = process.env.CODEQ_GRAPH_SHARED === "1";
+
 async function initialize() {
-  if (CodeGraph.isInitialized(root)) {
+  if (shared) {
+    graph = await CodeGraph.open(root, { sync: false });
+  } else if (CodeGraph.isInitialized(root)) {
     graph = await CodeGraph.open(root, { sync: true });
   } else {
     graph = await CodeGraph.init(root, { index: false });
@@ -44,13 +51,15 @@ async function initialize() {
       },
     });
   }
-  const watching = graph.watch({
-    onSyncComplete: () =>
-      send({ type: "sync", at: new Date().toISOString() }),
-    onSyncError: (error) =>
-      send({ type: "degraded", reason: `auto-sync failed: ${error.message}` }),
-    onDegraded: (reason) => send({ type: "degraded", reason }),
-  });
+  const watching =
+    !shared &&
+    graph.watch({
+      onSyncComplete: () =>
+        send({ type: "sync", at: new Date().toISOString() }),
+      onSyncError: (error) =>
+        send({ type: "degraded", reason: `auto-sync failed: ${error.message}` }),
+      onDegraded: (reason) => send({ type: "degraded", reason }),
+    });
   handler = new ToolHandler(graph);
   send({ type: "ready", watching });
 }

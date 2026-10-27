@@ -1,4 +1,14 @@
-import { CALLEE_CAP, CALLER_CAP, ENTRY_CAP } from "./limits.js";
+import {
+  CALLEE_CAP,
+  CALLER_CAP,
+  ENTRY_CAP,
+  GIANT_HEAD_LINES,
+  GIANT_SPAN_LINES,
+  MEMBER_CAP,
+} from "./limits.js";
+import { callerTier, isTestPath } from "./path-class.js";
+
+export { callerTier, isTestPath };
 
 const FILE_SECTION = /^\*\*`([^`]+)`\*\*(?:\s+—\s+(.*))?$/;
 const BLAST_LINE = /^- `([^`]+)`\s+\(([^()]+?):(\d+)\)\s+—\s+(.*)$/;
@@ -43,11 +53,6 @@ export const DEFINITION_KINDS = new Set([
   "variable",
   "component",
 ]);
-
-const TEST_PATH = /(^|\/)tests?(\/|$)|_test\.|spec\.|__tests__|\.test\./;
-const BENCH_SEGMENT = /(^|\/)(benchmarks?|bench)(\/|$)/i;
-const NAMED_TESTS_SEGMENT = /(^|\/)[^/]+[-_]tests?(\/|$)/i;
-const ROOT_BENCHMARK = /^benchmarks?\.(js|cjs|mjs|ts|py)$/i;
 
 const STOP_WORDS = new Set([
   "a",
@@ -95,16 +100,6 @@ export function kindRank(kind) {
   if (kind === "function" || kind === "method") return 0;
   if (kind === "class") return 1;
   return 2;
-}
-
-export function isTestPath(filePath) {
-  const path = String(filePath || "").replace(/\\/g, "/");
-  if (TEST_PATH.test(path)) return true;
-  if (BENCH_SEGMENT.test(path)) return true;
-  if (NAMED_TESTS_SEGMENT.test(path)) return true;
-  const relative = path.replace(/^\.\/+/, "");
-  const segments = relative.split("/").filter((part) => part && part !== ".");
-  return segments.length === 1 && ROOT_BENCHMARK.test(segments[0]);
 }
 
 export function inPathScope(filePath, constraint) {
@@ -387,6 +382,7 @@ function toEntry(span, hit = null) {
     pinned: true,
     callees: span?.callees || [],
     callers: span?.callers || [],
+    members: span?.members || [],
   };
 }
 
@@ -461,9 +457,9 @@ function capLocators(items, cap) {
   return { shown: items.slice(0, cap), hidden: items.slice(cap) };
 }
 
-function callerRank(a, b) {
-  const test = Number(isTestPath(a.path)) - Number(isTestPath(b.path));
-  if (test) return test;
+export function callerRank(a, b) {
+  const tier = callerTier(a.path) - callerTier(b.path);
+  if (tier) return tier;
   const byPath = String(a.path).localeCompare(String(b.path));
   if (byPath) return byPath;
   const byLine = (a.line || 0) - (b.line || 0);
@@ -471,12 +467,101 @@ function callerRank(a, b) {
   return String(a.name).localeCompare(String(b.name));
 }
 
-export function collectCallees(entries, cap = CALLEE_CAP) {
-  return capLocators(collectLocators(entries, "callees"), cap);
+export function spanLines(start, end) {
+  const from = Number(start) || 0;
+  const to = Number(end) || from;
+  if (!from) return 0;
+  return Math.max(1, to - from + 1);
 }
 
-export function collectCallers(entries, cap = CALLER_CAP) {
-  return capLocators(collectLocators(entries, "callers").sort(callerRank), cap);
+export function isGiantSpan(start, end) {
+  return spanLines(start, end) > GIANT_SPAN_LINES;
+}
+
+// The head of a giant definition is the part that actually identifies it: the
+// declaration plus whatever precedes the first member. Everything after that is
+// the body, which the member locators index instead.
+export function headEnd(entry) {
+  const start = entry.startLine;
+  const end = entry.endLine || start;
+  const members = entry.members || [];
+  let limit = start + GIANT_HEAD_LINES - 1;
+  const first = members
+    .map((member) => member.line)
+    .filter((line) => Number.isFinite(line) && line > start)
+    .sort((a, b) => a - b)[0];
+  if (first) limit = Math.min(limit, first - 1);
+  return Math.max(start, Math.min(end, limit));
+}
+
+function memberRank(a, b) {
+  const byCallers = (b.callerCount || 0) - (a.callerCount || 0);
+  if (byCallers) return byCallers;
+  return (a.line || 0) - (b.line || 0);
+}
+
+// Members the engine reports for a nested definition (a decorator closure
+// inside a method) describe the body of another member, not an entry point into
+// the class, so only top-level members are offered.
+function topLevelMembers(members) {
+  return (members || []).filter((member) => {
+    if (!member?.name || !member.path || !member.line) return false;
+    return !members.some(
+      (other) =>
+        other !== member &&
+        other.path === member.path &&
+        other.line < member.line &&
+        (other.endLine || other.line) >= (member.endLine || member.line),
+    );
+  });
+}
+
+export function collectMembers(entries, cap = MEMBER_CAP) {
+  const seen = new Set();
+  const items = [];
+  for (const entry of entries) {
+    if (!entry.spanCapped) continue;
+    for (const member of topLevelMembers(entry.members)) {
+      const key = `${member.name}\0${member.path}\0${member.line}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(member);
+    }
+  }
+  items.sort(memberRank);
+  return capLocators(items, cap);
+}
+
+// A multi-thousand-line class must never be handed over as one "read this span"
+// instruction, so the presented span is clipped to the head and the body is
+// reached through member locators instead.
+function capGiantEntries(entries) {
+  return entries.map((entry) => {
+    const end = entry.endLine || entry.startLine;
+    if (!isGiantSpan(entry.startLine, end)) return entry;
+    const capped = { ...entry, spanCapped: true, definitionEndLine: end };
+    capped.endLine = headEnd(capped);
+    return capped;
+  });
+}
+
+function inScope(items, constraint) {
+  if (!constraint) return items;
+  return items.filter((item) => inPathScope(item.path, constraint));
+}
+
+export function collectCallees(entries, cap = CALLEE_CAP, constraint = null) {
+  return capLocators(
+    inScope(collectLocators(entries, "callees"), constraint),
+    cap,
+  );
+}
+
+export function collectCallers(entries, cap = CALLER_CAP, constraint = null) {
+  return capLocators(
+    inScope(collectLocators(entries, "callers"), constraint).sort(callerRank),
+    cap,
+  );
 }
 
 export function neighborhood(result) {
@@ -488,13 +573,26 @@ export function neighborhood(result) {
     result.symbols,
     result.constraint,
   );
-  const entries = applyOrder(
-    resolved,
-    result.entryOrder,
-    (entry) => `${entry.path}:${entry.startLine}`,
+  const entries = capGiantEntries(
+    applyOrder(
+      resolved,
+      result.entryOrder,
+      (entry) => `${entry.path}:${entry.startLine}`,
+    ),
   );
-  const collectedCallees = collectCallees(entries);
-  const collectedCallers = collectCallers(entries);
+  // path: narrows this call, so it has to narrow the neighbourhood too —
+  // otherwise the reply tells the agent to pass path: and nothing changes.
+  const collectedMembers = collectMembers(entries);
+  const collectedCallees = collectCallees(
+    entries,
+    CALLEE_CAP,
+    result.constraint,
+  );
+  const collectedCallers = collectCallers(
+    entries,
+    CALLER_CAP,
+    result.constraint,
+  );
   const callees = applyOrder(
     collectedCallees.shown,
     result.calleeOrder,
@@ -512,6 +610,8 @@ export function neighborhood(result) {
     entries,
     callees,
     callers,
+    members: collectedMembers.shown,
+    hiddenMembers: collectedMembers.hidden,
     hiddenCallees: collectedCallees.hidden,
     hiddenCallers: collectedCallers.hidden,
     extraFiles: Math.max(0, dump.files.length - entries.length),

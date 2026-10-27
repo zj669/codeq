@@ -205,7 +205,7 @@ const TOOLS = [
         entries: {
           type: "array",
           description:
-            "Exact identifier hits, pinned first. Empty when there is no exact hit.",
+            "Exact identifier hits, pinned first. Empty when there is no exact hit. When spanCapped is true the definition was too long to read as one span: startLine-endLine is only its head, the full definition ends at definitionEndLine, and members lists the way in.",
           items: {
             type: "object",
             properties: {
@@ -214,6 +214,23 @@ const TOOLS = [
               startLine: { type: "integer" },
               endLine: { type: "integer" },
               kind: { type: "string" },
+              spanCapped: { type: "boolean" },
+              definitionEndLine: { type: "integer" },
+              definitionLines: { type: "integer" },
+            },
+          },
+        },
+        members: {
+          type: "array",
+          description:
+            "Callable entry points inside a spanCapped entry, most-called first. Read one of these instead of the whole definition.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              path: { type: "string" },
+              line: { type: "integer" },
+              endLine: { type: "integer" },
             },
           },
         },

@@ -1,76 +1,7 @@
-import { isTestPath } from "./graph-map.js";
 import { FIND_CAP, GREP_CAP, RANK_WINDOW, pageLimit } from "./limits.js";
+import { isConfigPath, isDocsPath, pathTier } from "./path-class.js";
 
-const DOCS_SEGMENT = /(^|\/)(docs?|documentation|examples?|samples?|tutorials?)(\/|$)/i;
-const AGENTS_SEGMENT = /(^|\/)\.agents(\/|$)/;
-const SKILL_BASENAME = /^skill(?:\.md)?$/i;
-
-function posixPath(filePath) {
-  return String(filePath || "").replace(/\\/g, "/");
-}
-
-const CI_SEGMENT = /(^|\/)\.(github|circleci|gitlab)(\/|$)/;
-const GENERATED_SEGMENT = /(^|\/)(dist|coverage)(\/|$)/;
-const DEVCONTAINER_SEGMENT = /(^|\/)\.devcontainer(\/|$)/;
-const MIN_ASSET = /\.min\.(js|cjs|mjs|css)$/i;
-const AUX_META = new Set([
-  ".editorconfig",
-  ".gitignore",
-  ".gitattributes",
-  ".readthedocs.yaml",
-  ".readthedocs.yml",
-]);
-const DOC_META_BASENAME =
-  /^(changelog|changes|license|copying|authors|contributing|code_of_conduct)(\..+)?$/i;
-const ROOT_PROSE = /\.(md|rst)$/i;
-const RC_BASENAME = /^\.[^./]*rc(\.|$)/i;
-const BROWSERSLIST_RC = /^\.browserslistrc$/i;
-const ROOT_DOT_SCRIPT = /^\.[^/]+\.(js|cjs|mjs|ts)$/i;
-const ROOT_CONFIG_SCRIPT = /\.config\.(js|cjs|mjs|ts|json)$/i;
-const ROOT_KARMA = /^karma\.conf\./i;
-
-function isRepoRootFile(path) {
-  const relative = posixPath(path).replace(/^\.\/+/, "");
-  const segments = relative.split("/").filter((part) => part && part !== ".");
-  return segments.length === 1;
-}
-
-export function isDocsPath(filePath) {
-  const path = posixPath(filePath);
-  if (DOCS_SEGMENT.test(path)) return true;
-  if (AGENTS_SEGMENT.test(path)) return true;
-  const base = path.split("/").pop() || "";
-  if (SKILL_BASENAME.test(base)) return true;
-  if (/^readme(?:\..+)?$/i.test(base)) return true;
-  if (DOC_META_BASENAME.test(base)) return true;
-  if (isRepoRootFile(path) && ROOT_PROSE.test(base)) return true;
-  return false;
-}
-
-export function isConfigPath(filePath) {
-  const path = posixPath(filePath);
-  if (CI_SEGMENT.test(path)) return true;
-  const base = path.split("/").pop() || "";
-  if (base.toLowerCase() === "py.typed") return true;
-  if (RC_BASENAME.test(base) || BROWSERSLIST_RC.test(base)) return true;
-  if (GENERATED_SEGMENT.test(path)) return true;
-  if (MIN_ASSET.test(base)) return true;
-  if (DEVCONTAINER_SEGMENT.test(path)) return true;
-  if (AUX_META.has(base.toLowerCase())) return true;
-  if (!isRepoRootFile(path)) return false;
-  return (
-    ROOT_DOT_SCRIPT.test(base) ||
-    ROOT_CONFIG_SCRIPT.test(base) ||
-    ROOT_KARMA.test(base)
-  );
-}
-
-export function pathTier(filePath) {
-  if (isDocsPath(filePath)) return 3;
-  if (isTestPath(filePath)) return 2;
-  if (isConfigPath(filePath)) return 1;
-  return 0;
-}
+export { isConfigPath, isDocsPath, pathTier };
 
 export function identifierAt(text, column) {
   const line = String(text ?? "");

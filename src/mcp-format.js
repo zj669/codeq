@@ -1,5 +1,5 @@
 import { hasGlobSyntax, literalFragment } from "./find-glob.js";
-import { neighborhood } from "./graph-map.js";
+import { neighborhood, spanLines } from "./graph-map.js";
 import {
   CALLEE_CAP,
   CALLER_CAP,
@@ -42,6 +42,32 @@ export const GRAPH_LOCATED = [
   "located. Read at most the entry span, not the whole file.",
   "do not find these files; do not grep or graph this identifier again unless this map is wrong.",
 ];
+
+// path: also scopes the entry, so it only narrows the neighbourhood at or above
+// the definition's own directory; graphing a listed name is the other lever.
+export const GRAPH_REFINE =
+  "more exist: graph one of the names above, or add path: under the entry's own directory — do not re-run graph on this identifier unchanged.";
+
+export function giantSpanNote(entry, hasEntryPoints) {
+  const lines = spanLines(entry.startLine, entry.definitionEndLine);
+  const kind = entry.kind ? `${entry.kind} ` : "";
+  const head = `${kind}body spans ${entry.startLine}-${entry.definitionEndLine} (${lines} lines)`;
+  return hasEntryPoints
+    ? `${head} — too big to read; use the entry points below`
+    : `${head} — too big to read whole; the span above is its head, Read on only if that is not enough`;
+}
+
+// Which of the shown member locators live inside this entry's full definition,
+// so a capped entry with no members of its own does not advertise entry points
+// that belong to a different entry.
+function entryHasMembers(entry, members) {
+  return members.some(
+    (member) =>
+      member.path === entry.path &&
+      member.line > entry.startLine &&
+      member.line <= (entry.definitionEndLine || entry.endLine),
+  );
+}
 
 export const FIND_CONFIRM =
   "this is a path; Read it if you need the file — do not find to confirm";
@@ -91,7 +117,8 @@ export function freshnessLine(result = {}) {
     if (result.lastSuccessfulSync) {
       parts.push(`lastSuccessfulSync ${result.lastSuccessfulSync}`);
     }
-    if (result.warning) parts.push(`warning ${result.warning}`);
+    if (result.fffWarning) parts.push(`warning ${result.fffWarning}`);
+    if (result.graphWarning) parts.push(`warning ${result.graphWarning}`);
   }
   return parts.join(" ");
 }
@@ -468,11 +495,16 @@ function formatGraph(result) {
     entries,
     callees,
     callers,
+    members,
+    hiddenMembers,
     hiddenCallees,
     hiddenCallers,
   } = map;
   const query = result.query ?? "";
-  const truncated = hiddenCallees.length > 0 || hiddenCallers.length > 0;
+  const truncated =
+    hiddenCallees.length > 0 ||
+    hiddenCallers.length > 0 ||
+    hiddenMembers.length > 0;
   const lines = [];
 
   if (entries.length > 0) {
@@ -481,6 +513,17 @@ function formatGraph(result) {
     );
     lines.push("");
     appendLocators(lines, entries, (entry) => entry.symbol);
+    for (const entry of entries) {
+      if (!entry.spanCapped) continue;
+      lines.push(giantSpanNote(entry, entryHasMembers(entry, members)));
+    }
+    if (members.length > 0) {
+      lines.push("", "entry points");
+      appendLocators(lines, members, (member) => member.name);
+      if (hiddenMembers.length > 0) {
+        lines.push(`+${hiddenMembers.length} methods omitted`);
+      }
+    }
     if (callees.length > 0) {
       lines.push("", "callees");
       appendLocators(lines, callees, (callee) => callee.name);
@@ -496,6 +539,7 @@ function formatGraph(result) {
       }
     }
     lines.push("", ...GRAPH_LOCATED);
+    if (truncated) lines.push(GRAPH_REFINE);
   } else if (identifiers.length > 0) {
     lines.push(
       `graph "${query}" — NO exact hit on ${identifiers.join(", ")}`,
@@ -528,6 +572,22 @@ function formatGraph(result) {
         startLine: entry.startLine,
         endLine: entry.endLine || entry.startLine,
         ...(entry.kind ? { kind: entry.kind } : {}),
+        ...(entry.spanCapped
+          ? {
+              spanCapped: true,
+              definitionEndLine: entry.definitionEndLine,
+              definitionLines: spanLines(
+                entry.startLine,
+                entry.definitionEndLine,
+              ),
+            }
+          : {}),
+      })),
+      members: members.map((member) => ({
+        name: member.name,
+        path: member.path,
+        line: member.line,
+        ...(member.endLine ? { endLine: member.endLine } : {}),
       })),
       callees: callees.map((callee) => ({
         name: callee.name,

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createServer } from "node:net";
-import { rm, writeFile } from "node:fs/promises";
+import { rename, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
@@ -37,6 +37,7 @@ const graphDirs = {};
 let lastRequestAt = Date.now();
 let shuttingDown = false;
 let pruningIndexes = false;
+let registrySequence = 0;
 
 ensurePrivateDir(paths.base);
 ensurePrivateDir(paths.daemonDir);
@@ -57,8 +58,14 @@ async function persistRegistry() {
       lastAccessedAt: new Date(entry.lastAccess).toISOString(),
     })),
   };
-  await writeFile(paths.packageVersion, `${version}\n`);
-  await writeFile(paths.registry, `${JSON.stringify(value, null, 2)}\n`);
+  const stamp = `${process.pid}.${registrySequence += 1}`;
+  await writeFile(`${paths.packageVersion}.${stamp}.tmp`, `${version}\n`);
+  await rename(`${paths.packageVersion}.${stamp}.tmp`, paths.packageVersion);
+  await writeFile(
+    `${paths.registry}.${stamp}.tmp`,
+    `${JSON.stringify(value, null, 2)}\n`,
+  );
+  await rename(`${paths.registry}.${stamp}.tmp`, paths.registry);
 }
 
 function injectGraphDir(root) {
@@ -80,7 +87,13 @@ function pruneDiskIndexes() {
       base: paths.base,
       ...indexGcOptionsFromEnv(),
       inUseRoots: live,
-      inUseKeys: live.map((root) => rootBucket(paths.base, root).key),
+      inUseKeys: [
+        ...live.map((root) => rootBucket(paths.base, root).key),
+        // A root reading another worktree's index keeps that bucket in use.
+        ...[...roots.values()]
+          .map((context) => context.sharedGraph?.key)
+          .filter(Boolean),
+      ],
     });
   } catch {
   } finally {
@@ -197,6 +210,17 @@ const server = createServer((socket) => {
       request = JSON.parse(input.slice(0, newline));
     } catch (error) {
       send(socket, { type: "error", error: `invalid request: ${error.message}` });
+      socket.end();
+      return;
+    }
+    // A connect alone proves nothing — a wedged daemon still owns the listen
+    // backlog. Answering ping proves the event loop is alive.
+    if (request.command === "ping") {
+      lastRequestAt = Date.now();
+      send(socket, {
+        type: "result",
+        result: { pid: process.pid, version },
+      });
       socket.end();
       return;
     }

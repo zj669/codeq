@@ -49,7 +49,8 @@ async function withServer(options, fn) {
     query: async (request) => ({
       root: request.root || request.cwd,
       status: "ready",
-      warning: null,
+      fffWarning: null,
+      graphWarning: null,
       total: 0,
       results: [],
       result: "graph-output",
@@ -283,7 +284,8 @@ test("tools map 1:1 onto daemon find/grep/graph requests", async () => {
         return {
           root: "/repo",
           status: "indexing",
-          warning: null,
+          fffWarning: null,
+          graphWarning: null,
           total: 1,
           results: [{ path: "src/app.ts" }],
           result: "explore",
@@ -1166,7 +1168,8 @@ test("MCP replies start with freshness and keep a graph budget", async () => {
     {
       query: async (request) => ({
         status: "degraded",
-        warning: "stale",
+        fffWarning: "stale",
+        graphWarning: null,
         lastSuccessfulSync: "2026-09-21T10:00:00.000Z",
         root: "/repo",
         query: request.query,

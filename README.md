@@ -107,6 +107,12 @@ in memory. CodeGraph is pinned to 1.6.0 with a data-dir patch only, under
 count cap, and a size budget; the next search may rebuild. That is better than
 filling the disk.
 
+A second worktree of the same repository holding the same content reads the
+index the first one built instead of building its own: no second index, no
+second copy on disk. Content is the key — the repository, the checked-out
+commit, and the blob hash of everything that differs from it — so editing
+either worktree ends the sharing and that worktree indexes itself.
+
 ```bash
 npm uninstall -g @zj669/codeq
 ```

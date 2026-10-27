@@ -4,6 +4,11 @@ export const RANK_WINDOW = 48;
 export const ENTRY_CAP = 3;
 export const CALLEE_CAP = 4;
 export const CALLER_CAP = 4;
+// A definition longer than this is never presented as one readable span; the
+// reply clips it to GIANT_HEAD_LINES and indexes the body by member locators.
+export const GIANT_SPAN_LINES = 200;
+export const GIANT_HEAD_LINES = 40;
+export const MEMBER_CAP = 6;
 export const JEV_TIMEOUT_MS = 800;
 export const JEV_CANDIDATE_CAP = 16;
 export const MATCH_TEXT_CHARS = 200;

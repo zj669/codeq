@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { writeFile } from "node:fs/promises";
+import { rename, writeFile } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,8 @@ import {
   ensurePrivateFile,
   rootBucket,
 } from "./paths.js";
+import { findSharedGraph, touchGraphSource } from "./graph-share.js";
+import { worktreeFingerprint } from "./worktree.js";
 import { planFindSearch, runFindSearch } from "./find-glob.js";
 
 const require = createRequire(import.meta.url);
@@ -95,11 +97,16 @@ function bundledNode() {
 export class RootContext {
   constructor(root, dataDir) {
     this.root = root;
+    this.dataDir = dataDir;
     this.location = rootBucket(dataDir, root);
     this.lastAccess = Date.now();
     this.active = 0;
     this.status = "indexing";
-    this.warning = null;
+    this.fffWarning = null;
+    this.graphWarning = null;
+    this.fffWatchFailed = false;
+    this.fffWatcherReady = true;
+    this.metadataSequence = 0;
     this.lastSuccessfulSync = null;
     this.finder = null;
     this.graphReady = false;
@@ -110,23 +117,36 @@ export class RootContext {
     this.fffUnwatch = null;
     this.fffPromise = this.#initializeFff();
     this.graphPromise = null;
+    // Set once a graph index exists for this root: the content fingerprint it
+    // was built from, and the root that owns it when it is not ours.
+    this.graphFingerprint = null;
+    this.sharedGraph = null;
   }
 
+  // Other processes parse root.json (index sharing, tests): a torn write
+  // reads as invalid JSON, so publish atomically. The temp name is unique
+  // per call — concurrent touches write and rename independently.
   async #writeMetadata() {
     ensurePrivateDir(this.location.bucket);
+    const temp = `${this.location.metadata}.${process.pid}.${++this.metadataSequence}.tmp`;
     await writeFile(
-      this.location.metadata,
+      temp,
       `${JSON.stringify(
         {
           root: this.root,
           schema: 1,
           codegraphVersion: "1.6.0",
           lastAccessedAt: new Date(this.lastAccess).toISOString(),
+          ...(this.graphFingerprint
+            ? { graphFingerprint: this.graphFingerprint }
+            : {}),
+          ...(this.sharedGraph ? { sharedGraphRoot: this.sharedGraph.root } : {}),
         },
         null,
         2,
       )}\n`,
     );
+    await rename(temp, this.location.metadata);
     ensurePrivateFile(this.location.metadata);
   }
 
@@ -135,6 +155,7 @@ export class RootContext {
     const created = FileFinder.create({
       basePath: this.root,
       aiMode: true,
+      disableWatch: process.env.CODEQ_FFF_DISABLE_WATCH === "1",
     });
     this.finder = unwrap(created, "FFF initialization failed");
     this.#subscribeFffWatch();
@@ -143,7 +164,7 @@ export class RootContext {
       "FFF initial scan failed",
     );
     if (!scanned) {
-      this.warning = "FFF initial scan is still running";
+      this.fffWarning = "FFF initial scan is still running";
     }
     this.#noteFffFreshness(this.finder);
     this.#refreshStatus();
@@ -154,13 +175,30 @@ export class RootContext {
     if (!this.finder?.watch) return;
     const watched = this.finder.watch((events) => {
       if (!events?.some((event) => event.kind === "rescan")) return;
-      this.warning = "FFF missed filesystem events and is rescanning";
+      this.fffWarning = "FFF missed filesystem events and is rescanning";
       this.#refreshStatus();
       try {
         this.finder.scanFiles();
       } catch {}
     });
-    if (watched.ok) this.fffUnwatch = watched.value;
+    if (watched.ok) {
+      this.fffUnwatch = watched.value;
+      return;
+    }
+    // No live events: without a rescan the index goes silently stale.
+    this.fffWatchFailed = true;
+    this.fffWarning = `FFF watcher failed: ${watched.error || "unknown error"}`;
+    this.#refreshStatus();
+  }
+
+  // With no watcher the only fresh answer is a rescan; scanFiles is
+  // incremental and asynchronous, so each query stays cheap while the
+  // index catches up.
+  #rescanIfWatcherDown() {
+    if (!this.fffWatchFailed && this.fffWatcherReady) return;
+    try {
+      this.finder?.scanFiles();
+    } catch {}
   }
 
   #noteFffFreshness(finder) {
@@ -168,13 +206,15 @@ export class RootContext {
     if (!progressResult?.ok) return;
     const snap = progressResult.value;
     if (snap.isScanning) return;
-    if (this.warning === "FFF initial scan is still running") {
-      this.warning = null;
+    this.fffWatcherReady = snap.isWatcherReady !== false;
+    if (this.fffWarning === "FFF initial scan is still running") {
+      this.fffWarning = null;
     }
     if (snap.isWatcherReady === false) {
-      this.warning = this.warning || "FFF watcher is not covering this root";
-    } else if (this.warning === "FFF watcher is not covering this root") {
-      this.warning = null;
+      this.fffWarning =
+        this.fffWarning || "FFF watcher is not covering this root";
+    } else if (this.fffWarning === "FFF watcher is not covering this root") {
+      this.fffWarning = null;
     }
     if (snap.isWatcherReady && !this.lastSuccessfulSync) {
       this.lastSuccessfulSync = new Date().toISOString();
@@ -182,7 +222,7 @@ export class RootContext {
   }
 
   #refreshStatus() {
-    if (this.warning) {
+    if (this.fffWarning || this.graphWarning) {
       this.status = "degraded";
       return;
     }
@@ -195,7 +235,8 @@ export class RootContext {
 
   touch() {
     this.lastAccess = Date.now();
-    void this.#writeMetadata();
+    if (this.sharedGraph) touchGraphSource(this.sharedGraph, this.lastAccess);
+    void this.#writeMetadata().catch(() => {});
   }
 
   async use(operation) {
@@ -213,7 +254,9 @@ export class RootContext {
     this.graphProgressListeners.add(onProgress);
     if (!this.graphPromise) {
       this.graphPromise = this.#initializeGraph().catch((error) => {
-        this.warning = `CodeGraph indexing failed: ${error.message}`;
+        // A rejected promise must not be reused: the next query retries.
+        this.graphPromise = null;
+        this.graphWarning = `CodeGraph indexing failed: ${error.message}`;
         this.#refreshStatus();
         throw error;
       });
@@ -229,21 +272,39 @@ export class RootContext {
   // process that could reach the same bucket, and is released once the worker
   // reports ready — queries after that run concurrently.
   async #initializeGraph() {
+    const fingerprint = await worktreeFingerprint(this.root);
+    const shared = await findSharedGraph(this.dataDir, {
+      root: this.root,
+      fingerprint,
+      verify: (candidate) => worktreeFingerprint(candidate),
+    });
     const held = await acquireLock(this.location.graphLock, {
       timeoutMs: GRAPH_LOCK_TIMEOUT_MS,
       label: `codegraph ${this.root}`,
     });
     try {
-      return await this.#openGraph();
+      if (shared) {
+        try {
+          return await this.#openGraph(fingerprint, shared);
+        } catch (error) {
+          // The source bucket can be reclaimed or replaced between the match
+          // and the open; build our own index rather than fail the query.
+          this.#teardownGraph(`shared graph unusable: ${error.message}`);
+        }
+      }
+      return await this.#openGraph(fingerprint, null);
     } finally {
       held.release?.();
     }
   }
 
-  async #openGraph() {
-    ensurePrivateDir(this.location.graphDir);
+  async #openGraph(fingerprint, shared) {
+    this.sharedGraph = shared;
+    const graphDir = shared ? shared.graphDir : this.location.graphDir;
+    if (shared) touchGraphSource(shared, this.lastAccess);
+    else ensurePrivateDir(graphDir);
     const worker = fileURLToPath(new URL("./graph-worker.js", import.meta.url));
-    this.graphProcess = spawn(
+    const child = spawn(
       bundledNode(),
       ["--liftoff-only", worker, this.root],
       {
@@ -251,16 +312,18 @@ export class RootContext {
         env: {
           ...process.env,
           CODEQ_CODEGRAPH_DATA_DIRS: JSON.stringify({
-            [this.root]: this.location.graphDir,
+            [this.root]: graphDir,
           }),
+          ...(shared ? { CODEQ_GRAPH_SHARED: "1" } : {}),
         },
       },
     );
-    this.graphProcess.stderr.setEncoding("utf8");
-    this.graphProcess.stderr.on("data", (chunk) => {
+    this.graphProcess = child;
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
       process.stderr.write(`[codegraph:${this.location.key.slice(0, 8)}] ${chunk}`);
     });
-    this.graphProcess.stdout.setEncoding("utf8");
+    child.stdout.setEncoding("utf8");
 
     return new Promise((resolve, reject) => {
       let output = "";
@@ -271,18 +334,28 @@ export class RootContext {
           reject(error);
         }
       };
-      this.graphProcess.once("error", fail);
-      this.graphProcess.once("exit", (code, signal) => {
+      child.once("error", fail);
+      child.once("exit", (code, signal) => {
+        // teardown/dispose already accounted for this child; a stale exit
+        // must not touch the worker that replaced it.
+        if (this.graphProcess !== child) return;
+        this.graphProcess = null;
         this.graphReady = false;
         const error = new Error(
           `CodeGraph worker exited (${signal || code || "unknown"})`,
         );
+        if (settled) {
+          // Past ready the init promise had resolved: clear it so the next
+          // query spawns a fresh worker instead of writing to a dead one.
+          this.graphPromise = null;
+          this.graphWarning = error.message;
+        }
         fail(error);
         for (const pending of this.graphPending.values()) pending.reject(error);
         this.graphPending.clear();
         this.#refreshStatus();
       });
-      this.graphProcess.stdout.on("data", (chunk) => {
+      child.stdout.on("data", (chunk) => {
         output += chunk;
         for (;;) {
           const newline = output.indexOf("\n");
@@ -301,9 +374,15 @@ export class RootContext {
           } else if (message.type === "ready") {
             this.graphReady = true;
             this.lastSuccessfulSync = new Date().toISOString();
-            if (!message.watching) {
-              this.warning = "CodeGraph watcher could not be started";
+            this.graphWarning = null;
+            // A shared index is read-only here by design, so its worker never
+            // watches; this root revalidates the fingerprint on every query.
+            if (!message.watching && !shared) {
+              this.graphWarning = "CodeGraph watcher could not be started";
             }
+            void this.#recordGraphFingerprint(fingerprint, shared).catch(
+              () => {},
+            );
             this.#refreshStatus();
             if (!settled) {
               settled = true;
@@ -311,10 +390,10 @@ export class RootContext {
             }
           } else if (message.type === "sync") {
             this.lastSuccessfulSync = message.at;
-            this.warning = null;
+            this.graphWarning = null;
             this.#refreshStatus();
           } else if (message.type === "degraded") {
-            this.warning = `CodeGraph watcher degraded: ${message.reason}`;
+            this.graphWarning = `CodeGraph watcher degraded: ${message.reason}`;
             this.#refreshStatus();
           } else if (message.type === "response") {
             const pending = this.graphPending.get(message.id);
@@ -333,19 +412,66 @@ export class RootContext {
     });
   }
 
+  // Publish the fingerprint only once the content it describes survived the
+  // whole index run: a tree edited mid-index would otherwise offer another
+  // worktree a database that matches neither fingerprint.
+  async #recordGraphFingerprint(fingerprint, shared) {
+    if (!fingerprint) return;
+    if (!shared && (await worktreeFingerprint(this.root)) !== fingerprint) return;
+    this.graphFingerprint = fingerprint;
+    await this.#writeMetadata();
+  }
+
+  #teardownGraph(reason) {
+    this.sharedGraph = null;
+    this.graphFingerprint = null;
+    this.graphReady = false;
+    const error = new Error(reason);
+    for (const pending of this.graphPending.values()) pending.reject(error);
+    this.graphPending.clear();
+    try {
+      this.graphProcess?.stdin.end();
+      this.graphProcess?.kill("SIGTERM");
+    } catch {}
+    this.graphProcess = null;
+  }
+
+  // A shared index is another worktree's database. It answers for this root
+  // only while both trees still hash to the fingerprint it was built from, so
+  // any edit on either side drops the share and re-indexes here.
+  async #revalidateSharedGraph(onProgress) {
+    const shared = this.sharedGraph;
+    const [mine, theirs] = await Promise.all([
+      worktreeFingerprint(this.root),
+      worktreeFingerprint(shared.root),
+    ]);
+    // A concurrent query may have dropped the share while we were hashing;
+    // whatever it started is the index to wait for.
+    if (this.sharedGraph !== shared) {
+      await this.startGraphIndex(onProgress);
+      return;
+    }
+    if (mine === shared.fingerprint && theirs === shared.fingerprint) return;
+    this.#teardownGraph("shared graph index no longer matches this worktree");
+    this.graphPromise = null;
+    await this.startGraphIndex(onProgress);
+  }
+
   metadata() {
     if (this.finder) this.#noteFffFreshness(this.finder);
     this.#refreshStatus();
     return {
       root: this.root,
       status: this.status,
-      warning: this.warning,
+      fffWarning: this.fffWarning,
+      graphWarning: this.graphWarning,
       lastSuccessfulSync: this.lastSuccessfulSync,
     };
   }
 
   async find(query, options) {
     const finder = await this.fffPromise;
+    this.#rescanIfWatcherDown();
     const plan = planFindSearch(query, options.constraint);
     const { value, globFallback } = runFindSearch(plan, (needle) =>
       unwrap(
@@ -378,6 +504,7 @@ export class RootContext {
     const fuzzyRequested = Boolean(options.fuzzy);
     const mode = assertGrepPattern(pattern, { regex });
     const finder = await this.fffPromise;
+    this.#rescanIfWatcherDown();
     const constraints = [];
     if (options.constraint) constraints.push(options.constraint);
     if (options.glob) constraints.push(options.glob);
@@ -548,13 +675,21 @@ export class RootContext {
 
   async explore(query, options, onProgress) {
     await this.startGraphIndex(onProgress);
+    if (this.sharedGraph) await this.#revalidateSharedGraph(onProgress);
     const scoped = options.constraint
       ? `${query} path:${options.constraint.replace(/\/$/, "")}`
       : query;
     const id = ++this.graphSequence;
     const payload = await new Promise((resolve, reject) => {
+      const worker = this.graphProcess;
+      if (!worker || worker.exitCode !== null || worker.signalCode !== null) {
+        reject(
+          new Error(this.graphWarning || "CodeGraph worker is not running"),
+        );
+        return;
+      }
       this.graphPending.set(id, { resolve, reject });
-      this.graphProcess.stdin.write(`${JSON.stringify({ id, query: scoped })}\n`);
+      worker.stdin.write(`${JSON.stringify({ id, query: scoped })}\n`);
     });
     const text = typeof payload === "string" ? payload : payload.text;
     const symbols = typeof payload === "string" ? [] : payload.symbols || [];

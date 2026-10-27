@@ -13,6 +13,14 @@ import {
 } from "../src/limits.js";
 import { isTestPath } from "../src/graph-map.js";
 import {
+  CALLER_TIER_BENCH,
+  CALLER_TIER_DOCS,
+  CALLER_TIER_PRODUCTION,
+  CALLER_TIER_TEST,
+  callerTier,
+  isBenchPath,
+} from "../src/path-class.js";
+import {
   applyFindWindow,
   applyGrepWindow,
   isConfigPath,
@@ -103,6 +111,13 @@ test("isDocsPath matches doc segments and README names", () => {
   assert.equal(isDocsPath("intro.md"), true);
   assert.equal(isDocsPath("LICENSE"), true);
   assert.equal(isDocsPath("src/notes.md"), false);
+  // Documentation trees that carry a _src/-src suffix are still documentation.
+  assert.equal(isDocsPath("docs_src/tutorial/main.py"), true);
+  assert.equal(isDocsPath("docs-src/tutorial/main.py"), true);
+  assert.equal(isDocsPath("examples_src/app.py"), true);
+  assert.equal(isDocsPath("doc_source/app.py"), true);
+  assert.equal(isDocsPath("src/docsite/app.py"), false);
+  assert.equal(isDocsPath("src/documents/app.py"), false);
 });
 
 test("isTestPath matches foo.test.ts without treating production files as tests", () => {
@@ -128,6 +143,46 @@ test("isTestPath matches foo.test.ts without treating production files as tests"
   assert.equal(pathTier("src/skills/encode.ts"), 0);
   assert.equal(pathTier(".agents/skills/x/SKILL.md"), 3);
   assert.equal(pathTier("library/src/actions/args/args.test.ts"), 2);
+});
+
+test("isBenchPath only refines paths that are already non-production", () => {
+  assert.equal(isBenchPath("tests/benchmarks/utils.py"), true);
+  assert.equal(isBenchPath("tests/memory_benchmarks/test_graph.py"), true);
+  assert.equal(isBenchPath("benchmarks/foo.js"), true);
+  assert.equal(isBenchPath("bench/foo.js"), true);
+  assert.equal(isBenchPath("benchmark.js"), true);
+  assert.equal(isBenchPath("tests/test_annotated.py"), false);
+  // Production code keeps its rank even when it mentions a benchmark.
+  assert.equal(isBenchPath("src/benchmark.js"), false);
+  assert.equal(isBenchPath("src/bench.py"), false);
+  assert.equal(isBenchPath("fastapi/applications.py"), false);
+});
+
+test("callerTier ranks production ahead of tests, benchmarks, docs and examples", () => {
+  assert.equal(callerTier("fastapi/applications.py"), CALLER_TIER_PRODUCTION);
+  assert.equal(callerTier("src/main.ts"), CALLER_TIER_PRODUCTION);
+  assert.equal(callerTier("tests/test_annotated.py"), CALLER_TIER_TEST);
+  assert.equal(callerTier("tests/benchmarks/utils.py"), CALLER_TIER_BENCH);
+  assert.equal(
+    callerTier("tests/memory_benchmarks/test_graph.py"),
+    CALLER_TIER_BENCH,
+  );
+  assert.equal(callerTier("docs/tutorial/intro.py"), CALLER_TIER_DOCS);
+  assert.equal(callerTier("examples/app.py"), CALLER_TIER_DOCS);
+  // Production strictly precedes every noise tier.
+  for (const noisy of [
+    "tests/test_annotated.py",
+    "tests/benchmarks/utils.py",
+    "docs/tutorial/intro.py",
+    "examples/app.py",
+  ]) {
+    assert.ok(callerTier("fastapi/applications.py") < callerTier(noisy), noisy);
+  }
+  // A benchmark helper never outranks a real test.
+  assert.ok(
+    callerTier("tests/test_annotated.py") <
+      callerTier("tests/benchmarks/utils.py"),
+  );
 });
 
 test("pathTier demotes docs more than tests, production is 0", () => {

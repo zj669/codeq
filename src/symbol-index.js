@@ -1,11 +1,13 @@
 import {
   DEFINITION_KINDS,
   inPathScope,
+  isGiantSpan,
   kindRank,
   queryIdentifiers,
 } from "./graph-map.js";
 
 const CALL_KINDS = new Set(["calls", "instantiates"]);
+const MEMBER_KINDS = new Set(["function", "method"]);
 
 const BLAST_LINE = /^- `([^`]+)`\s+\(([^()]+?):(\d+)\)\s+—\s+/;
 
@@ -100,6 +102,48 @@ function locator(node) {
   };
 }
 
+function callerCount(graph, nodeId) {
+  if (typeof graph.getIncomingEdges !== "function") return 0;
+  try {
+    return (graph.getIncomingEdges(nodeId) || []).filter(
+      (edge) => edge && CALL_KINDS.has(edge.kind),
+    ).length;
+  } catch {
+    return 0;
+  }
+}
+
+// Callable definitions nested inside a giant definition's span. These are what
+// the reply offers instead of the whole span, so each one carries its own
+// caller count: the most-called method is the most useful way in.
+export function memberNodes(graph, node) {
+  const end = node.endLine || node.startLine;
+  if (!isGiantSpan(node.startLine, end)) return [];
+  if (typeof graph.getNodesInFile !== "function") return [];
+  let inFile = [];
+  try {
+    inFile = graph.getNodesInFile(node.filePath) || [];
+  } catch {
+    return [];
+  }
+  return inFile
+    .filter(
+      (other) =>
+        other &&
+        other.id !== node.id &&
+        MEMBER_KINDS.has(other.kind) &&
+        other.startLine > node.startLine &&
+        (other.endLine || other.startLine) <= end,
+    )
+    .map((other) => ({
+      name: other.name,
+      path: other.filePath,
+      line: other.startLine,
+      endLine: other.endLine || other.startLine,
+      callerCount: callerCount(graph, other.id),
+    }));
+}
+
 function exactNameDefsFromNodes(nodes, name, constraint) {
   const wanted = name.toLowerCase();
   return (nodes || []).filter((node) => {
@@ -150,6 +194,7 @@ function symbolsFromExactDefs(graph, defsByName) {
           getNode,
           "source",
         ),
+        members: memberNodes(graph, node),
       });
     }
   }

@@ -11,9 +11,11 @@ import {
   directCallerNodes,
   graphSearch,
   identifiersHaveExactDefs,
+  memberNodes,
   pickDefinition,
   symbolIndex,
 } from "../src/symbol-index.js";
+import { GIANT_SPAN_LINES } from "../src/limits.js";
 
 const bin = fileURLToPath(new URL("../bin/codeq.js", import.meta.url));
 
@@ -100,6 +102,65 @@ test("pickDefinition chooses the hinted function, not a shorter namesake", () =>
   ];
   const picked = pickDefinition(nodes, { path: "src/pkg/widget.py", line: 14 });
   assert.equal(picked.id, "b");
+});
+
+test("memberNodes only collects callables inside a giant span", () => {
+  const def = {
+    id: "cls",
+    kind: "class",
+    name: "Huge",
+    filePath: "src/huge.py",
+    startLine: 10,
+    endLine: 10 + GIANT_SPAN_LINES,
+  };
+  const inFile = [
+    def,
+    { id: "m1", kind: "method", name: "run", filePath: "src/huge.py", startLine: 20, endLine: 40 },
+    { id: "m2", kind: "function", name: "helper", filePath: "src/huge.py", startLine: 50, endLine: 60 },
+    // Not callables.
+    { id: "v1", kind: "variable", name: "LIMIT", filePath: "src/huge.py", startLine: 12, endLine: 12 },
+    { id: "i1", kind: "import", name: "os", filePath: "src/huge.py", startLine: 1, endLine: 1 },
+    // Outside the class span.
+    { id: "m3", kind: "function", name: "after", filePath: "src/huge.py", startLine: 900, endLine: 910 },
+    { id: "m4", kind: "function", name: "before", filePath: "src/huge.py", startLine: 2, endLine: 5 },
+  ];
+  const graph = {
+    getNodesInFile: () => inFile,
+    getIncomingEdges: (id) =>
+      id === "m2" ? [{ kind: "calls" }, { kind: "references" }] : [],
+  };
+  const members = memberNodes(graph, def);
+  assert.deepEqual(
+    members.map((member) => member.name),
+    ["run", "helper"],
+  );
+  // callerCount counts call edges only, so ranking is not skewed by imports.
+  assert.deepEqual(
+    members.map((member) => member.callerCount),
+    [0, 1],
+  );
+});
+
+test("memberNodes stays empty for a definition under the giant threshold", () => {
+  const def = {
+    id: "cls",
+    kind: "class",
+    name: "Small",
+    filePath: "src/small.py",
+    startLine: 1,
+    endLine: GIANT_SPAN_LINES,
+  };
+  let scanned = false;
+  const graph = {
+    getNodesInFile: () => {
+      scanned = true;
+      return [];
+    },
+    getIncomingEdges: () => [],
+  };
+  assert.deepEqual(memberNodes(graph, def), []);
+  // The per-file scan is skipped entirely, so normal symbols cost nothing.
+  assert.equal(scanned, false);
 });
 
 test("direct callees are calls only, and each callee once", () => {
