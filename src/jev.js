@@ -405,8 +405,23 @@ export async function maybeRerank(command, request, result, options) {
     );
   }
   try {
-    const next = await rerank(command, request, result, options);
-    return withJev(next, { applied: true });
+    // JEV_TIMEOUT_MS must bound the reply, not only the SDK call: a rerank
+    // that outlives the budget (hung socket the client timeout misses, slow
+    // payload build) must not hold the query hostage. Race the rerank against
+    // a budget timer; the loser keeps the engine page and reports timeout.
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("timeout")), JEV_TIMEOUT_MS);
+    });
+    try {
+      const next = await Promise.race([
+        rerank(command, request, result, options),
+        timeout,
+      ]);
+      return withJev(next, { applied: true });
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (error) {
     return withJev(result, { applied: false, skipped: skipReason(error) });
   }

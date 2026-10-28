@@ -294,13 +294,14 @@ export function writeSidecar(
     omitted.length > 0 ? ["", ...omitted.map((item) => `omitted ${item}`)] : [];
   const body = [...headerLines, ...bodyLines, ...omittedBlock, ""].join("\n");
 
+  let tmpPath;
   try {
     sweepSidecars(base, now);
     const dir = sidecarDir(base);
     ensureDir(dir);
     const name = uniqueName(command, root, query);
     const finalPath = join(dir, name);
-    const tmpPath = `${finalPath}.tmp`;
+    tmpPath = `${finalPath}.tmp`;
     writeFileSync(tmpPath, body, { encoding: "utf8" });
     chmodSync(tmpPath, FILE_MODE);
     renameSync(tmpPath, finalPath);
@@ -311,6 +312,11 @@ export function writeSidecar(
       omitted: [...omitted],
     };
   } catch {
+    if (tmpPath) {
+      try {
+        unlinkSync(tmpPath);
+      } catch {}
+    }
     return null;
   }
 }

@@ -16,6 +16,7 @@ codeq find foo.py
 codeq grep "TODO" --glob "**/*.py"
 codeq grep 'foo.*Bar' --regex
 codeq graph "how does foo work"
+codeq graph "how does foo work" --no-wait   # provisional reply instead of blocking on a cold index
 codeq mcp
 ```
 
@@ -84,10 +85,24 @@ indexed.
 Every reply's first line names the resolved root (`via root argument` /
 `via path argument` / `via cwd:…`). Wrong tree → retry with `root`.
 
+The daemon keeps a small pool of live roots. Several cold roots in one burst
+queue for slots; replies that waited carry `pool busy` in the status line and
+`poolBusy` in `structuredContent`. That is a "one root at a time" signal, not
+a miss — wait for `status: ready` on the root you need, or pass `root` to aim
+the next call, instead of fanning out wider.
+
 Default replies are locators (no source). There is no `detail:"full"` and no
 `--full`. `grep` is a **literal** by default; `regex: true` / `--regex` is
 explicit; `--fuzzy` / `fuzzy: true` is labelled `[fuzzy]`. Grep pages with an
 opaque `cursor` bound to that same search.
+
+On a fresh repository the first `graph` call waits while the code index
+builds (seconds; `find`/`grep` answer provisionally in the meantime). That
+default is unchanged — nothing blocks unless you ask for a graph answer. If
+you only want to kick the build off and keep working, pass `wait: false`
+(MCP) or `--no-wait` (CLI) on that one `graph` call: it replies immediately
+with `indexReady: false`, the build continues in the background, and the
+same call later returns the real answer once `status` is `ready`.
 
 ## Optional Jev rerank
 
@@ -106,6 +121,12 @@ in memory. CodeGraph is pinned to 1.6.0 with a data-dir patch only, under
 `roots/<sha>/codegraph/`. Unused per-root indexes there are pruned by age, a
 count cap, and a size budget; the next search may rebuild. That is better than
 filling the disk.
+
+A second worktree of the same repository holding the same content reads the
+index the first one built instead of building its own: no second index, no
+second copy on disk. Content is the key — the repository, the checked-out
+commit, and the blob hash of everything that differs from it — so editing
+either worktree ends the sharing and that worktree indexes itself.
 
 ```bash
 npm uninstall -g @zj669/codeq

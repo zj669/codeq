@@ -113,7 +113,7 @@ test("grep next cursor stays in the ranked window before following FFF", () => {
   const nextWindow = openGrepCursor(lastInWindow, search);
   assert.equal(nextWindow.offset, 0);
   assert.equal(nextWindow.window, 9001);
-  assert.equal(GREP_CURSOR_VERSION, 4);
+  assert.equal(GREP_CURSOR_VERSION, 5);
 });
 
 test("grep cursor binds context and ignoreCase; v3 tokens are stale", () => {
@@ -154,4 +154,17 @@ test("grep cursor binds context and ignoreCase; v3 tokens are stale", () => {
   );
   assert.match(GREP_CURSOR_ERROR, /context/);
   assert.match(GREP_CURSOR_ERROR, /ignoreCase/);
+});
+
+test("grep cursor continuation without context adopts the bound value", () => {
+  const bound = { ...search, context: 1, ignoreCase: "false" };
+  const token = encodeGrepCursor(bound, 16, 0);
+  const opened = openGrepCursor(token, { ...bound, context: undefined });
+  assert.equal(opened.offset, 16);
+  assert.equal(opened.context, 1);
+  // An explicit context is still compared, adopted or not.
+  assert.throws(
+    () => openGrepCursor(token, { ...bound, context: 3 }),
+    (error) => error.message === GREP_CURSOR_ERROR,
+  );
 });

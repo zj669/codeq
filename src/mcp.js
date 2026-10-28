@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { queryDaemon } from "./client.js";
+import { GREP_CONTEXT_DEFAULT } from "./limits.js";
 import {
   EMPTY_TOOL_MENU,
   formatMcpToolResult,
@@ -47,17 +48,52 @@ const LOCATOR_SCHEMA = {
   status: { type: ["string", "null"] },
   root: { type: ["string", "null"] },
   truncated: { type: "boolean" },
+  indexReady: {
+    type: "boolean",
+    description:
+      "false while the index is still building or degraded — results are provisional, retry the query when status is ready.",
+  },
+  poolBusy: {
+    type: "boolean",
+    description:
+      "true when several distinct roots are being indexed at once. One call still serves exactly one root; retry later or pass root to narrow.",
+  },
+  stalePaths: {
+    type: "array",
+    description:
+      "Files that changed on disk after the index was built; locators in them may have drifted — Read the file to confirm.",
+    items: { type: "string" },
+  },
 };
 
 const OUTPUT_SCHEMA_NOTE =
   "Text has the retrieval facts; ignoring this object only loses machine navigation, pagination, and diagnostics.";
+
+const TRUNCATION_SCHEMA = {
+  type: "object",
+  description:
+    "Present only when truncated is true. The page is partial: when retry is present, re-issue the same tool once with it merged into the arguments — it is the continuation, already computed; when absent, nothing narrower is known and next carries the fallback. shown is this page's locator count, total/remaining when known, next describes the continuation. Do not re-run the query unchanged or re-check with host tools.",
+  properties: {
+    shown: { type: "integer" },
+    total: { type: "integer" },
+    remaining: { type: "integer" },
+    omitted: { type: "object" },
+    next: { type: "string" },
+    retry: {
+      type: "object",
+      description:
+        "Arguments to merge into the same tool's arguments for the one continuation call — e.g. {cursor} for grep, {limit} or {path} for find, {query} or {path} for graph. Absent when nothing narrower is known; the text then carries the only advice.",
+    },
+  },
+  required: ["shown", "next"],
+};
 
 const TOOLS = [
   {
     name: "find",
     title: "Find files",
     description:
-      "Fuzzy file/path lookup, including dotfiles. Query is a path fragment, not a glob. If you already know the directory and filename, Read it; do not find to confirm.",
+      "Pick this when you have a file name or path fragment and need its real path — it answers 'where is X' in one call where host Glob or shell ls/find would scan. Fuzzy file/path lookup, including dotfiles. Query is a path fragment, not a glob. If you already know the directory and filename, Read it; do not find to confirm.",
     inputSchema: {
       type: "object",
       properties: {
@@ -78,6 +114,7 @@ const TOOLS = [
       properties: {
         ...LOCATOR_SCHEMA,
         paths: { type: "array", items: { type: "string" } },
+        truncation: TRUNCATION_SCHEMA,
         globFallback: {
           type: "object",
           properties: {
@@ -98,7 +135,7 @@ const TOOLS = [
     name: "grep",
     title: "Search file contents",
     description:
-      "Content search; this is not rg. regex is required: false for a literal string, true for a regular expression. After this pattern has already returned locators, do not open host Ripgrep on the same token. Pass fuzzy:true for approximate/different identifiers. Need nearby source for a hit, pass context (at most 3); this is not rg and not host Read. After locators are returned, do not Read hit files whole, and do not find that basename. Returns matching lines.",
+      "Content search; this is not rg. regex is required: false for a literal string, true for a regular expression. After this pattern has already returned locators, do not open host Ripgrep on the same token. Pass fuzzy:true for approximate/different identifiers. Each hit shows one neighbor line by default; pass context (at most 3) for more, 0 for locators only; this is not rg and not host Read. After locators are returned, do not Read hit files whole — each hit carries read:{path,offset,limit} for the host Read tool. Do not find that basename. Returns matching lines.",
     inputSchema: {
       type: "object",
       properties: {
@@ -133,7 +170,7 @@ const TOOLS = [
           type: "integer",
           minimum: 0,
           description:
-            "Neighboring source lines around each hit. Default 0, maximum 3. Not rg and not host Read.",
+            "Neighboring source lines around each hit. Default 1, maximum 3; pass 0 for locators only. Not rg and not host Read.",
         },
         count: {
           type: "boolean",
@@ -162,12 +199,28 @@ const TOOLS = [
               line: { type: "integer" },
               column: { type: "integer" },
               text: { type: "string" },
+              read: {
+                type: "object",
+                description:
+                  "Host Read parameters for this hit: path, offset, limit. Use instead of reading the whole file.",
+                properties: {
+                  path: { type: "string" },
+                  offset: { type: "integer" },
+                  limit: { type: "integer" },
+                },
+              },
+              stale: {
+                type: "boolean",
+                description:
+                  "The file changed after the index; this line may have drifted — Read the file to confirm.",
+              },
               before: { type: "array", items: { type: "string" } },
               after: { type: "array", items: { type: "string" } },
             },
           },
         },
         nextCursor: { type: "string" },
+        truncation: TRUNCATION_SCHEMA,
         matchCount: { type: "integer" },
         fileCount: { type: "integer" },
       },
@@ -183,7 +236,7 @@ const TOOLS = [
     name: "graph",
     title: "Explore the code graph",
     description:
-      'Identifiers, or a short question about how X works, where X is defined, or who calls / uses X. Returns an entry span, direct callees, and direct callers — a map, not an answer or source. The how-it-works entry span plus direct neighborhood is the locate; if you still Read, Read only that span, not the whole file; do not then find or grep the same name. For who-calls or where-used, use the callers locators; do not grep that name first. Bounded neighborhood, not an exhaustive callgraph. There is no callers tool.',
+      'Pick this when the question names a symbol: an identifier, or a short question about how X works, where X is defined, or who calls / uses X — it answers these in one call where grep would take several. Returns an entry span, direct callees, and direct callers — a map, not an answer or source. The how-it-works entry span plus direct neighborhood is the locate; if you still Read, Read only that span, not the whole file; do not then find or grep the same name. For who-calls or where-used, use the callers locators; do not grep that name first. Bounded neighborhood, not an exhaustive callgraph. There is no callers tool.',
     inputSchema: {
       type: "object",
       properties: {
@@ -194,6 +247,11 @@ const TOOLS = [
         },
         path: PATH_PROPERTY,
         root: ROOT_PROPERTY,
+        wait: {
+          type: "boolean",
+          description:
+            "Default true. On a fresh repository the first graph call blocks while the index builds (seconds). Pass wait:false to get a provisional reply immediately — indexReady false — and retry the same call once status is ready. Only this call is affected.",
+        },
       },
       required: ["query"],
     },
@@ -205,7 +263,7 @@ const TOOLS = [
         entries: {
           type: "array",
           description:
-            "Exact identifier hits, pinned first. Empty when there is no exact hit.",
+            "Exact identifier hits, pinned first. Empty when there is no exact hit. When spanCapped is true the definition was too long to read as one span: startLine-endLine is only its head, the full definition ends at definitionEndLine, and members lists the way in.",
           items: {
             type: "object",
             properties: {
@@ -213,7 +271,26 @@ const TOOLS = [
               path: { type: "string" },
               startLine: { type: "integer" },
               endLine: { type: "integer" },
+              stale: { type: "boolean" },
               kind: { type: "string" },
+              spanCapped: { type: "boolean" },
+              definitionEndLine: { type: "integer" },
+              definitionLines: { type: "integer" },
+            },
+          },
+        },
+        members: {
+          type: "array",
+          description:
+            "Callable entry points inside a spanCapped entry, most-called first. Read one of these instead of the whole definition.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              path: { type: "string" },
+              line: { type: "integer" },
+              endLine: { type: "integer" },
+              stale: { type: "boolean" },
             },
           },
         },
@@ -228,6 +305,7 @@ const TOOLS = [
               path: { type: "string" },
               line: { type: "integer" },
               endLine: { type: "integer" },
+              stale: { type: "boolean" },
             },
           },
         },
@@ -242,9 +320,11 @@ const TOOLS = [
               path: { type: "string" },
               line: { type: "integer" },
               endLine: { type: "integer" },
+              stale: { type: "boolean" },
             },
           },
         },
+        truncation: TRUNCATION_SCHEMA,
       },
       required: ["status", "root", "truncated", "entries"],
     },
@@ -417,6 +497,9 @@ function toolRequest(name, args, cwd) {
     }
     if (args.context !== undefined) {
       request.context = positiveInteger(args.context, "context", true);
+    } else if (args.count !== true && args.cursor === undefined) {
+      // Cursor calls omit context on purpose: the bound token carries it.
+      request.context = GREP_CONTEXT_DEFAULT;
     }
     if (args.count !== undefined) request.count = Boolean(args.count);
     if (args.ignoreCase !== undefined) {
@@ -435,6 +518,7 @@ function toolRequest(name, args, cwd) {
     };
     if (args.path !== undefined) request.path = String(args.path);
     if (args.root !== undefined) request.root = String(args.root);
+    if (args.wait !== undefined) request.wait = Boolean(args.wait);
     return request;
   }
   throw new Error(`unknown tool: ${name}`);

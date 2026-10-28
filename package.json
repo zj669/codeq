@@ -17,7 +17,8 @@
   "scripts": {
     "postinstall": "node scripts/patch-codegraph.mjs",
     "verify:patch": "node scripts/patch-codegraph.mjs --check",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "eval": "node eval/run.js"
   },
   "engines": {
     "node": ">=22.5 <25"

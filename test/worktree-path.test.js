@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -9,11 +9,13 @@ import {
   realpathSync,
   writeFileSync,
 } from "node:fs";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { daemonPaths } from "../src/paths.js";
 
 const bin = fileURLToPath(new URL("../bin/codeq.js", import.meta.url));
 const { version } = createRequire(import.meta.url)("../package.json");
@@ -60,6 +62,37 @@ function stopDaemon(dataDir) {
     try {
       process.kill(pid, "SIGTERM");
     } catch {}
+  }
+}
+
+function socketConnectable(path) {
+  return new Promise((resolve) => {
+    const socket = connect(path);
+    socket.once("connect", () => {
+      socket.end();
+      resolve(true);
+    });
+    socket.once("error", () => resolve(false));
+  });
+}
+
+async function waitFor(check, label, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await check();
+    if (value) return value;
+    if (Date.now() >= deadline) assert.fail(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+function processGone(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const state = stat.slice(stat.lastIndexOf(")") + 2)[0];
+    return state === "Z" || state === "X";
+  } catch {
+    return true;
   }
 }
 
@@ -159,43 +192,66 @@ test(
 test(
   "a daemon from an older package is replaced on the next query",
   { timeout: 120_000 },
-  (t) => {
+  async (t) => {
     const parent = mkdtempSync(join(tmpdir(), "codeq-daemon-ver-"));
     const dataDir = join(parent, "data");
     const env = { ...process.env, CODEQ_DATA_DIR: dataDir };
     delete env.CODEQ_CWD;
     t.after(() => stopDaemon(dataDir));
     const repo = repository(parent, "app");
+    const paths = daemonPaths(dataDir);
+    mkdirSync(paths.daemonDir, { recursive: true });
 
-    const first = cliJson(["find", "foo.py"], { cwd: repo, env });
-    assert.equal(first.ok, true, first.stderr || first.stdout);
-    const pidFile = join(dataDir, "daemon", "daemon.pid");
-    const versionFile = join(dataDir, "daemon", "package-version");
-    const registryFile = join(dataDir, "daemon", "registry.json");
-    const firstPid = Number(readFileSync(pidFile, "utf8").trim());
-    assert.equal(readFileSync(versionFile, "utf8").trim(), version);
-    const registry = JSON.parse(readFileSync(registryFile, "utf8"));
-    assert.equal(registry.version, version);
-    assert.equal(registry.pid, firstPid);
-
-    writeFileSync(versionFile, "0.0.0\n");
+    // A daemon from an older package is a different process on the same
+    // socket: it answers ping the way an old build answers any unknown
+    // command — an error, never a pong.
+    const imposter = fileURLToPath(
+      new URL("./fixtures/imposter.js", import.meta.url),
+    );
+    const fake = spawn(process.execPath, [imposter, paths.socket], {
+      detached: true,
+      stdio: "ignore",
+    });
+    fake.unref();
+    t.after(() => {
+      try {
+        process.kill(fake.pid, "SIGKILL");
+      } catch {}
+    });
+    await waitFor(
+      () => socketConnectable(paths.socket),
+      "imposter to listen",
+    );
+    writeFileSync(paths.pid, `${fake.pid}\n`);
+    writeFileSync(paths.packageVersion, "0.0.0\n");
     writeFileSync(
-      registryFile,
-      `${JSON.stringify({ ...registry, version: "0.0.0" }, null, 2)}\n`,
+      paths.registry,
+      `${JSON.stringify(
+        {
+          pid: fake.pid,
+          version: "0.0.0",
+          socket: paths.socket,
+          startedAt: new Date().toISOString(),
+          roots: [],
+        },
+        null,
+        2,
+      )}\n`,
     );
 
     const second = cliJson(["find", "foo.py"], { cwd: repo, env });
     assert.equal(second.ok, true, second.stderr || second.stdout);
-    const secondPid = Number(readFileSync(pidFile, "utf8").trim());
-    assert.notEqual(secondPid, firstPid);
-    assert.equal(readFileSync(versionFile, "utf8").trim(), version);
+    const secondPid = Number(readFileSync(paths.pid, "utf8").trim());
+    assert.notEqual(secondPid, fake.pid);
+    assert.equal(readFileSync(paths.packageVersion, "utf8").trim(), version);
     assert.equal(
-      JSON.parse(readFileSync(registryFile, "utf8")).version,
+      JSON.parse(readFileSync(paths.registry, "utf8")).version,
       version,
     );
+    await waitFor(() => processGone(fake.pid), "imposter to be stopped");
 
     const third = cliJson(["find", "foo.py"], { cwd: repo, env });
     assert.equal(third.ok, true, third.stderr || third.stdout);
-    assert.equal(Number(readFileSync(pidFile, "utf8").trim()), secondPid);
+    assert.equal(Number(readFileSync(paths.pid, "utf8").trim()), secondPid);
   },
 );

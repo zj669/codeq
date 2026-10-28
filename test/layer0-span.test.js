@@ -11,9 +11,11 @@ import {
   directCallerNodes,
   graphSearch,
   identifiersHaveExactDefs,
+  memberNodes,
   pickDefinition,
   symbolIndex,
 } from "../src/symbol-index.js";
+import { GIANT_SPAN_LINES } from "../src/limits.js";
 
 const bin = fileURLToPath(new URL("../bin/codeq.js", import.meta.url));
 
@@ -100,6 +102,65 @@ test("pickDefinition chooses the hinted function, not a shorter namesake", () =>
   ];
   const picked = pickDefinition(nodes, { path: "src/pkg/widget.py", line: 14 });
   assert.equal(picked.id, "b");
+});
+
+test("memberNodes only collects callables inside a giant span", () => {
+  const def = {
+    id: "cls",
+    kind: "class",
+    name: "Huge",
+    filePath: "src/huge.py",
+    startLine: 10,
+    endLine: 10 + GIANT_SPAN_LINES,
+  };
+  const inFile = [
+    def,
+    { id: "m1", kind: "method", name: "run", filePath: "src/huge.py", startLine: 20, endLine: 40 },
+    { id: "m2", kind: "function", name: "helper", filePath: "src/huge.py", startLine: 50, endLine: 60 },
+    // Not callables.
+    { id: "v1", kind: "variable", name: "LIMIT", filePath: "src/huge.py", startLine: 12, endLine: 12 },
+    { id: "i1", kind: "import", name: "os", filePath: "src/huge.py", startLine: 1, endLine: 1 },
+    // Outside the class span.
+    { id: "m3", kind: "function", name: "after", filePath: "src/huge.py", startLine: 900, endLine: 910 },
+    { id: "m4", kind: "function", name: "before", filePath: "src/huge.py", startLine: 2, endLine: 5 },
+  ];
+  const graph = {
+    getNodesInFile: () => inFile,
+    getIncomingEdges: (id) =>
+      id === "m2" ? [{ kind: "calls" }, { kind: "references" }] : [],
+  };
+  const members = memberNodes(graph, def);
+  assert.deepEqual(
+    members.map((member) => member.name),
+    ["run", "helper"],
+  );
+  // callerCount counts call edges only, so ranking is not skewed by imports.
+  assert.deepEqual(
+    members.map((member) => member.callerCount),
+    [0, 1],
+  );
+});
+
+test("memberNodes stays empty for a definition under the giant threshold", () => {
+  const def = {
+    id: "cls",
+    kind: "class",
+    name: "Small",
+    filePath: "src/small.py",
+    startLine: 1,
+    endLine: GIANT_SPAN_LINES,
+  };
+  let scanned = false;
+  const graph = {
+    getNodesInFile: () => {
+      scanned = true;
+      return [];
+    },
+    getIncomingEdges: () => [],
+  };
+  assert.deepEqual(memberNodes(graph, def), []);
+  // The per-file scan is skipped entirely, so normal symbols cost nothing.
+  assert.equal(scanned, false);
 });
 
 test("direct callees are calls only, and each callee once", () => {
@@ -298,6 +359,55 @@ function fakeGraph(nodes, { throwOnName = null } = {}) {
   return graph;
 }
 
+test("graphSearch resolves an identifier that is also an English word", async () => {
+  const path = {
+    id: "path",
+    kind: "class",
+    name: "Path",
+    filePath: "src/pkg/params.py",
+    startLine: 140,
+    endLine: 223,
+    outgoing: [],
+    incoming: [],
+  };
+  const use = {
+    id: "use",
+    kind: "function",
+    name: "use",
+    filePath: "src/pkg/view.py",
+    startLine: 7,
+    endLine: 8,
+    outgoing: [],
+    incoming: [],
+  };
+  const graph = fakeGraph([path, use]);
+  // A bare stop-word query has no prose to strip: the token IS the symbol.
+  const bare = await graphSearch(graph, "Path", async () => {
+    throw new Error("explore should not run for a resolved bare identifier");
+  });
+  assert.equal(bare.result, "");
+  assert.equal(bare.symbols.length, 1);
+  assert.equal(bare.symbols[0].name, "Path");
+  assert.equal(bare.symbols[0].path, "src/pkg/params.py");
+
+  // Prose around the symbol still resolves it: "who calls Path" must pin Path,
+  // not drop it as a stop word and return an empty symbol list.
+  const asked = await graphSearch(graph, "who calls Path", async () =>
+    "Found 0 symbols across 0 files.\n",
+  );
+  assert.equal(
+    asked.symbols.some((span) => span.name === "Path"),
+    true,
+  );
+  const useResult = await graphSearch(graph, "how does use work", async () =>
+    "Found 0 symbols across 0 files.\n",
+  );
+  assert.equal(
+    useResult.symbols.some((span) => span.name === "use"),
+    true,
+  );
+});
+
 test("graphSearch skips explore when every identifier has an exact-name definition", async () => {
   const paint = {
     id: "paint",
@@ -343,7 +453,9 @@ test("graphSearch skips explore when every identifier has an exact-name definiti
     result.symbols[0].callers.map((caller) => caller.name),
     ["show"],
   );
-  assert.deepEqual(graph.named, ["render_widget"]);
+  // Prose words are resolved too — a stop word that names a real symbol still
+  // deserves a lookup; the skip-explore gate is what stays on the primary set.
+  assert.deepEqual(graph.named, ["render_widget", "how", "does", "work"]);
   assert.equal(identifiersHaveExactDefs(graph, "how does render_widget work"), true);
 });
 
@@ -370,7 +482,13 @@ test("graphSearch explores when any identifier lacks an exact-name definition", 
   assert.deepEqual(seen, ["how does render_widget missing_identifier work"]);
   assert.equal(mixed.result, "Found 0 symbols across 0 files.\n");
   assert.equal(mixed.symbols.some((span) => span.name === "render_widget"), true);
-  assert.deepEqual(graph.named, ["render_widget", "missing_identifier"]);
+  assert.deepEqual(graph.named, [
+    "render_widget",
+    "missing_identifier",
+    "how",
+    "does",
+    "work",
+  ]);
   assert.equal(identifiersHaveExactDefs(graph, "how does missing_identifier work"), false);
 
   seen.length = 0;

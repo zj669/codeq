@@ -290,6 +290,25 @@ test("fail-open returns the engine page on Jev errors", async () => {
   assert.deepEqual(ranked.jev, { applied: false, skipped: "timeout" });
 });
 
+test("a Jev call that outlives the budget fails open near the timeout", async () => {
+  const started = Date.now();
+  const ranked = await maybeRerank(
+    "grep",
+    { query: "render_widget" },
+    grepResult,
+    {
+      env: { CODEQ_JEV_KEY: "x" },
+      // A hung call the SDK timeout never fires on must not hold the reply:
+      // maybeRerank races rerank against JEV_TIMEOUT_MS and keeps the page.
+      systemOne: () => new Promise(() => {}),
+    },
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < JEV_TIMEOUT_MS * 3, `expected fallback near ${JEV_TIMEOUT_MS}ms, took ${elapsed}ms`);
+  assert.deepEqual(ranked.results, grepResult.results);
+  assert.deepEqual(ranked.jev, { applied: false, skipped: "timeout" });
+});
+
 test("literal grep with a production vis16 skips the optional rerank", async () => {
   let called = 0;
   const systemOne = async () => {

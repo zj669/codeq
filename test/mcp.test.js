@@ -49,7 +49,8 @@ async function withServer(options, fn) {
     query: async (request) => ({
       root: request.root || request.cwd,
       status: "ready",
-      warning: null,
+      fffWarning: null,
+      graphWarning: null,
       total: 0,
       results: [],
       result: "graph-output",
@@ -283,7 +284,8 @@ test("tools map 1:1 onto daemon find/grep/graph requests", async () => {
         return {
           root: "/repo",
           status: "indexing",
-          warning: null,
+          fffWarning: null,
+          graphWarning: null,
           total: 1,
           results: [{ path: "src/app.ts" }],
           result: "explore",
@@ -497,6 +499,99 @@ test("grep forwards context, count, and ignoreCase; count rejects cursor", async
       const rejected = await waitFor((message) => message.id === 5);
       assert.equal(rejected.result.isError, true);
       assert.equal(rejected.result.content[0].text, GREP_COUNT_CURSOR_ERROR);
+    },
+  );
+});
+
+test("grep without context defaults to 1; context: 0 stays locator-only", async () => {
+  const seen = [];
+  await withServer(
+    {
+      query: async (request) => {
+        seen.push(request);
+        return {
+          root: "/repo",
+          status: "ready",
+          pattern: request.query,
+          mode: "plain",
+          context: request.context ?? 0,
+          results: [
+            {
+              path: "src/f0.ts",
+              line: 2,
+              column: 1,
+              text: "TODO",
+              contextBefore: ["before"],
+              contextAfter: ["after"],
+            },
+          ],
+        };
+      },
+    },
+    async ({ send, waitFor }) => {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {} },
+      });
+      await waitFor((message) => message.id === 1);
+
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "grep",
+          arguments: { pattern: "TODO", regex: false },
+        },
+      });
+      const defaulted = await waitFor((message) => message.id === 2);
+      assert.equal(seen[0].context, 1);
+      assert.match(defaulted.result.content[0].text, /^src\/f0\.ts:1 before$/m);
+      assert.match(defaulted.result.content[0].text, /^src\/f0\.ts:2 TODO$/m);
+      assert.match(defaulted.result.content[0].text, /^src\/f0\.ts:3 after$/m);
+
+      send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "grep",
+          arguments: { pattern: "TODO", regex: false, context: 0 },
+        },
+      });
+      const bare = await waitFor((message) => message.id === 3);
+      assert.equal(seen[1].context, 0);
+      assert.equal(bare.result.content[0].text.includes("before"), false);
+      assert.equal(bare.result.content[0].text.includes("after"), false);
+
+      send({
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: {
+          name: "grep",
+          arguments: { pattern: "TODO", regex: false, count: true },
+        },
+      });
+      await waitFor((message) => message.id === 4);
+      assert.equal(seen[2].context, undefined);
+
+      // A cursor call omits context so the daemon adopts the token's bound
+      // value instead of re-defaulting against it.
+      send({
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: {
+          name: "grep",
+          arguments: { pattern: "TODO", regex: false, cursor: "opaque" },
+        },
+      });
+      await waitFor((message) => message.id === 5);
+      assert.equal(seen[3].context, undefined);
+      assert.equal(seen[3].cursor, "opaque");
     },
   );
 });
@@ -1103,6 +1198,10 @@ test("tool descriptions say when to pass root and how to shape a query", async (
     assert.match(tools.grep.description, /do not Read hit files whole/);
     assert.match(tools.find.description, /do not find to confirm/);
     assert.match(
+      tools.find.description,
+      /Pick this when you have a file name or path fragment/,
+    );
+    assert.match(
       tools.grep.inputSchema.properties.limit.description,
       /1-48/,
     );
@@ -1166,7 +1265,8 @@ test("MCP replies start with freshness and keep a graph budget", async () => {
     {
       query: async (request) => ({
         status: "degraded",
-        warning: "stale",
+        fffWarning: "stale",
+        graphWarning: null,
         lastSuccessfulSync: "2026-09-21T10:00:00.000Z",
         root: "/repo",
         query: request.query,
@@ -1253,7 +1353,13 @@ test("machine fields ride structuredContent, not a JSON copy in the text", async
       assert.equal(grep.result.structuredContent.truncated, false);
       assert.equal("nextCursor" in grep.result.structuredContent, false);
       assert.deepEqual(grep.result.structuredContent.hits, [
-        { path: "src/app.ts", line: 3, column: 5, text: "const app = 1;" },
+        {
+          path: "src/app.ts",
+          line: 3,
+          column: 5,
+          text: "const app = 1;",
+          read: { path: "src/app.ts", offset: 1, limit: 11 },
+        },
       ]);
       assert.equal(text.includes('"hits"'), false);
       assert.equal(text.includes('"command": "grep"'), false);

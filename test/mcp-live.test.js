@@ -321,3 +321,110 @@ test("MCP grep context, count, and ignoreCase reach the daemon", async (t) => {
   assert.match(counted.result.content[0].text, /match(?:es)? in \d+ files?/);
   assert.equal(counted.result.content[0].text.includes("export class"), false);
 });
+
+test("MCP truncated grep continues through truncation.retry and returns the omitted hits", async (t) => {
+  const parent = mkdtempSync(join(tmpdir(), "codeq-mcp-retry-"));
+  const repo = join(parent, "app");
+  const dataDir = join(parent, "data");
+  mkdirSync(join(repo, "src"), { recursive: true });
+  // One identifier on every line of 20 files: a single grep page (16) cannot
+  // hold them all, so the first reply must truncate.
+  for (let index = 0; index < 20; index += 1) {
+    writeFileSync(
+      join(repo, "src", `f${index}.ts`),
+      `export const needle_marker_${index} = ${index};\n`,
+    );
+  }
+  git(repo, "init", "-b", "main");
+  git(repo, "add", ".");
+  git(
+    repo,
+    "-c",
+    "user.name=codeq-test",
+    "-c",
+    "user.email=codeq@example.invalid",
+    "commit",
+    "-m",
+    "fixture",
+  );
+
+  const child = spawn(process.execPath, [bin, "mcp"], {
+    stdio: ["pipe", "pipe", "pipe"],
+    cwd: repo,
+    env: { ...process.env, CODEQ_DATA_DIR: dataDir },
+  });
+  t.after(() => {
+    child.kill("SIGTERM");
+    const pidFile = join(dataDir, "daemon", "daemon.pid");
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isInteger(pid) && pid > 1) {
+        try {
+          process.kill(pid, "SIGTERM");
+        } catch {}
+      }
+    }
+  });
+
+  const messages = [];
+  const parse = createFramedParser((message) => messages.push(message));
+  child.stdout.on("data", (chunk) => parse(chunk));
+  const send = (message) => child.stdin.write(encodeMessage(message));
+
+  send({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "codeq-live-retry", version: "0" },
+    },
+  });
+  await waitFor(messages, (message) => message.id === 1, 5_000);
+
+  send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "grep",
+      arguments: { pattern: "needle_marker", regex: false, context: 0 },
+    },
+  });
+  const first = await waitFor(messages, (message) => message.id === 2, 60_000);
+  const page = first.result.structuredContent;
+  assert.equal(page.truncated, true, first.result.content[0].text);
+  assert.equal(page.hits.length, 16);
+  assert.ok(page.truncation, "truncated reply carries truncation");
+  // The continuation is executable as-is: merge retry into the same call.
+  assert.deepEqual(Object.keys(page.truncation.retry), ["cursor"]);
+  const seen = new Set(page.hits.map((hit) => hit.path));
+
+  send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: {
+      name: "grep",
+      arguments: {
+        pattern: "needle_marker",
+        regex: false,
+        context: 0,
+        ...page.truncation.retry,
+      },
+    },
+  });
+  const second = await waitFor(messages, (message) => message.id === 3, 60_000);
+  const next = second.result.structuredContent;
+  assert.equal(second.result.isError, undefined, second.result.content[0].text);
+  // Page 2 is exactly the hits page 1 omitted — no overlap, full coverage.
+  assert.equal(next.hits.length, 4);
+  for (const hit of next.hits) {
+    assert.equal(seen.has(hit.path), false, `${hit.path} was already on page 1`);
+    seen.add(hit.path);
+  }
+  assert.equal(seen.size, 20);
+  assert.equal(next.truncated, false);
+  assert.equal("truncation" in next, false);
+});
