@@ -72,7 +72,7 @@ const OUTPUT_SCHEMA_NOTE =
 const TRUNCATION_SCHEMA = {
   type: "object",
   description:
-    "Present only when truncated is true. The page is partial: re-issue the same tool once with retry merged into the arguments — it is the continuation, already computed. shown is this page's locator count, total/remaining when known, next describes the retry. Do not re-run the query unchanged or re-check with host tools.",
+    "Present only when truncated is true. The page is partial: when retry is present, re-issue the same tool once with it merged into the arguments — it is the continuation, already computed; when absent, nothing narrower is known and next carries the fallback. shown is this page's locator count, total/remaining when known, next describes the continuation. Do not re-run the query unchanged or re-check with host tools.",
   properties: {
     shown: { type: "integer" },
     total: { type: "integer" },

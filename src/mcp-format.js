@@ -33,7 +33,7 @@ Query one repository at a time. A burst across several roots at once saturates t
 
 A successful identifier grep or exact graph already located. Do not find those basenames, do not Read whole files for neighbor lines, and do not grep or graph the same identifier again. Neighbor lines = grep context:N (cap 3). Host Read only the span, and only when locator or neighbors are not enough.
 
-When truncated is true the page is partial and the omitted hits are real work you have not seen. Re-issue the same tool once with structuredContent.truncation.retry merged into the arguments — it is the continuation, already computed. Do not re-run the query unchanged and do not re-check with host tools instead.`;
+When truncated is true the page is partial and the omitted hits are real work you have not seen. If structuredContent.truncation.retry is present, re-issue the same tool once with it merged into the arguments — it is the continuation, already computed; if absent, nothing narrower is known — follow truncation.next instead. Do not re-run the query unchanged and do not re-check with host tools instead.`;
 
 export const EMPTY_TOOL_MENU = `codeq needs find.query, grep.pattern, or graph.query — do not call with {}.
 find: file name or path fragment (not a glob, not "a or b") — results are repo-relative paths for host Read.
@@ -53,20 +53,33 @@ export const GRAPH_LOCATED = [
 ];
 
 // A truncated page is a partial answer, not a final one — the evidence is that
-// agents read the flag and move on. So every truncated reply also carries
-// structuredContent.truncation.retry: arguments ready to merge into the same
-// tool's arguments and re-issue once, verbatim. The text line states the rule;
-// retry is the executable form of it.
+// agents read the flag and move on. So every truncated reply that has a
+// computable continuation also carries structuredContent.truncation.retry:
+// arguments ready to merge into the same tool's arguments and re-issue once,
+// verbatim. When nothing narrower is known the retry is omitted rather than
+// invented, and the text must not send the agent after it — hence two lines,
+// picked by retry's presence.
 export const TRUNCATED_CONTINUE =
   "truncated — continue once now: re-call the same tool with truncation.retry merged into the arguments";
+export const TRUNCATED_NO_RETRY =
+  "truncated — no narrower continuation known: follow truncation.next (omit an absent retry)";
 
 // path: also scopes the entry, so it only narrows the neighbourhood at or above
 // the definition's own directory; graphing an omitted name is the other lever.
 // truncation.retry already holds the first one — query: for an omitted symbol,
 // path: when only scoping is left — so the text line points there rather than
-// leaving the agent to pick a name itself.
+// leaving the agent to pick a name itself. When no omitted name is known and
+// the entry sits at the top level, retry is absent and the line falls back to
+// the generic continue advice rather than promising a retry that is not there.
 export const GRAPH_REFINE =
   "more exist — continue once now: re-call graph with truncation.retry merged into the arguments (an omitted name, or path: under the entry's own directory); do not re-run graph on this identifier unchanged.";
+export const GRAPH_REFINE_NO_RETRY =
+  "more exist — no narrower continuation known: follow truncation.next (omit an absent retry); do not re-run graph on this identifier unchanged.";
+
+export function truncatedContinue(retry, { graph = false } = {}) {
+  return retry ? (graph ? GRAPH_REFINE : TRUNCATED_CONTINUE)
+               : (graph ? GRAPH_REFINE_NO_RETRY : TRUNCATED_NO_RETRY);
+}
 
 export function giantSpanNote(entry, memberState) {
   const lines = spanLines(entry.startLine, entry.definitionEndLine);
@@ -378,6 +391,9 @@ function formatFind(result) {
   const pageCap = result.pageCap ?? RANK_WINDOW;
   const lines = [];
 
+  const retry = truncated ? findRetry(results, { shown, pageCap }) : null;
+  const continueLine = truncatedContinue(retry);
+
   lines.push(
     truncated
       ? `find ${query} — ${shown}/${matched} matches`
@@ -390,7 +406,7 @@ function formatFind(result) {
   if (truncated) {
     lines.push(
       "",
-      capped ? `capped at ${pageCap}; ${TRUNCATED_CONTINUE}` : TRUNCATED_CONTINUE,
+      capped ? `capped at ${pageCap}; ${continueLine}` : continueLine,
     );
     if (shortFindFragment(query)) {
       lines.push(
@@ -433,7 +449,7 @@ function formatFind(result) {
                 shown < pageCap
                   ? `raise limit toward ${pageCap}, or narrow with path`
                   : "narrow with path (limit is at the page cap)",
-              retry: findRetry(results, { shown, pageCap }),
+              retry,
             }),
           }
         : {}),
@@ -515,6 +531,11 @@ function formatGrep(result) {
   const display = orderGrepHits(hits, pattern, preserveOrder);
   const staleShown = display.filter((hit) => hit.stale).length;
   const context = Number.isSafeInteger(result.context) ? result.context : 0;
+  const retry = truncated
+    ? nextCursor
+      ? { cursor: nextCursor }
+      : grepScopeRetry(hits)
+    : null;
   const lines = [];
 
   if (fuzzy) {
@@ -577,7 +598,7 @@ function formatGrep(result) {
       );
     }
   } else if (truncated) {
-    lines.push("", TRUNCATED_CONTINUE);
+    lines.push("", truncatedContinue(retry));
   }
 
   if (staleShown > 0) {
@@ -639,7 +660,7 @@ function formatGrep(result) {
                   ? result.total
                   : null,
               next: "pass nextCursor as cursor",
-              retry: nextCursor ? { cursor: nextCursor } : grepScopeRetry(hits),
+              retry,
             }),
           }
         : {}),
@@ -711,6 +732,15 @@ function formatGraph(result) {
     hiddenCallees.length > 0 ||
     hiddenCallers.length > 0 ||
     hiddenMembers.length > 0;
+  const retry = truncated
+    ? graphRetry({
+        hiddenMembers,
+        hiddenCallees,
+        hiddenCallers,
+        entries,
+        query,
+      })
+    : null;
   const lines = [];
 
   if (entries.length > 0) {
@@ -779,7 +809,7 @@ function formatGraph(result) {
       );
     }
     lines.push("", ...GRAPH_LOCATED);
-    if (truncated) lines.push(GRAPH_REFINE);
+    if (truncated) lines.push(truncatedContinue(retry, { graph: true }));
   } else if (identifiersShown.length > 0) {
     lines.push(
       `graph "${query}" — NO exact hit on ${identifiersShown.join(", ")}`,
@@ -868,13 +898,7 @@ function formatGraph(result) {
                   : {}),
               },
               next: "graph an omitted name, or add path: under the entry's own directory",
-              retry: graphRetry({
-                hiddenMembers,
-                hiddenCallees,
-                hiddenCallers,
-                entries,
-                query,
-              }),
+              ...(retry ? { retry } : {}),
             },
           }
         : {}),

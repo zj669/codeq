@@ -615,6 +615,71 @@ test("truncated replies carry a machine-readable way to continue", () => {
   });
 });
 
+test("truncated replies without a computable retry do not promise one", () => {
+  // find: at the page cap with every hit at the top level — no subdirectory
+  // exists to narrow into, so retry is absent and the text must not send the
+  // agent after it.
+  const findFlat = formatMcpToolResult("find", {
+    status: "ready",
+    root: "/repo",
+    query: "t",
+    total: 100,
+    results: Array.from({ length: 48 }, (_, i) => ({ path: `t${i}.py` })),
+    requestedLimit: 100,
+    pageCap: 48,
+  });
+  assert.equal("retry" in findFlat.structuredContent.truncation, false);
+  assert.equal(findFlat.text.includes("truncation.retry"), false);
+  assert.match(findFlat.text, /follow truncation\.next/);
+  assert.equal(
+    findFlat.structuredContent.truncation.next,
+    "narrow with path (limit is at the page cap)",
+  );
+
+  // grep count: the scan stopped at the cap and returns no hits, so nothing
+  // narrower is known — the count sentence already names the fallback.
+  const counted = formatMcpToolResult("grep", {
+    status: "ready",
+    root: "/repo",
+    pattern: "token",
+    mode: "plain",
+    count: true,
+    countTruncated: true,
+    matchCount: 4096,
+    fileCount: 90,
+    results: [],
+  });
+  assert.equal("retry" in counted.structuredContent.truncation, false);
+  assert.equal(counted.text.includes("truncation.retry"), false);
+  assert.match(counted.text, /narrow with path\/glob for an exact count/);
+
+  // graph: a recursive entry whose callees all name the queried symbol leaves
+  // no omitted name to re-query, and a top-level path leaves no directory to
+  // narrow into — the line falls back instead of promising truncation.retry.
+  const graphFlat = formatMcpToolResult("graph", {
+    ...graphResult,
+    query: "rec",
+    symbols: [
+      {
+        name: "rec",
+        kind: "function",
+        path: "rec.ts",
+        startLine: 1,
+        endLine: 40,
+        callees: Array.from({ length: 8 }, (_, i) => ({
+          name: "rec",
+          path: "rec.ts",
+          line: i + 10,
+        })),
+      },
+    ],
+  });
+  assert.equal(graphFlat.structuredContent.truncated, true);
+  assert.equal("retry" in graphFlat.structuredContent.truncation, false);
+  assert.equal(graphFlat.text.includes("truncation.retry"), false);
+  assert.match(graphFlat.text, /follow truncation\.next/);
+});
+
 test("untruncated replies carry no truncation object", () => {
   for (const formatted of [
     formatMcpToolResult("find", {
