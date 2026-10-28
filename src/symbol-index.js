@@ -3,7 +3,7 @@ import {
   inPathScope,
   isGiantSpan,
   kindRank,
-  queryIdentifiers,
+  queryIdentifierParts,
 } from "./graph-map.js";
 
 const CALL_KINDS = new Set(["calls", "instantiates"]);
@@ -201,26 +201,40 @@ function symbolsFromExactDefs(graph, defsByName) {
   return symbols;
 }
 
+// Prose words ("how", "does") never resolve to a definition, so the
+// skip-explore gate only looks at the primary tokens — unless the query is all
+// prose-shaped, in which case its stop-word tokens are the candidates ("Path").
+function lookupNames(query) {
+  const parts = queryIdentifierParts(queryWithoutScope(query));
+  const names = [...parts.primary, ...parts.secondary];
+  const gate = parts.primary.length > 0 ? parts.primary : names;
+  return { names, gate };
+}
+
 export function identifiersHaveExactDefs(graph, query) {
-  const names = queryIdentifiers(queryWithoutScope(query));
+  const { names, gate } = lookupNames(query);
   if (names.length === 0) return false;
   if (typeof graph?.getNodesByName !== "function") return false;
   try {
-    const defsByName = collectExactNameDefs(graph, names, pathConstraint(query));
-    return names.every((name) => defsByName.get(name).length > 0);
+    const defsByName = collectExactNameDefs(
+      graph,
+      names,
+      pathConstraint(query),
+    );
+    return gate.every((name) => defsByName.get(name).length > 0);
   } catch {
     return false;
   }
 }
 
 export function symbolIndex(graph, query) {
-  const names = queryIdentifiers(queryWithoutScope(query));
+  const { names } = lookupNames(query);
   const constraint = pathConstraint(query);
   return symbolsFromExactDefs(graph, collectExactNameDefs(graph, names, constraint));
 }
 
 export async function graphSearch(graph, query, explore) {
-  const names = queryIdentifiers(queryWithoutScope(query));
+  const { names, gate } = lookupNames(query);
   const canResolve =
     names.length > 0 && typeof graph?.getNodesByName === "function";
   let defsByName = null;
@@ -234,7 +248,8 @@ export async function graphSearch(graph, query, explore) {
 
   const allExact =
     defsByName &&
-    names.every((name) => (defsByName.get(name) || []).length > 0);
+    gate.length > 0 &&
+    gate.every((name) => (defsByName.get(name) || []).length > 0);
 
   if (allExact) {
     try {

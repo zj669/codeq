@@ -11,7 +11,6 @@ import {
   RANK_WINDOW,
   pageLimit,
 } from "../src/limits.js";
-import { isTestPath } from "../src/graph-map.js";
 import {
   CALLER_TIER_BENCH,
   CALLER_TIER_CONFIG,
@@ -20,6 +19,7 @@ import {
   CALLER_TIER_TEST,
   callerTier,
   isBenchPath,
+  isTestPath,
 } from "../src/path-class.js";
 import {
   applyFindWindow,
@@ -681,8 +681,9 @@ test("same-tier grep round-robin pulls a later production file into vis16", () =
     first.page.some((item) => item.path === "src/pkg/needed.py"),
     true,
   );
-  assert.equal(first.page[0].path, "src/pkg/crowded.py");
-  assert.equal(first.page[1].path, "src/pkg/needed.py");
+  // The file that defines the pattern outranks the first-seen file.
+  assert.equal(first.page[0].path, "src/pkg/needed.py");
+  assert.equal(first.page[1].path, "src/pkg/crowded.py");
   assert.equal(
     first.page.filter((item) => item.path === "src/pkg/crowded.py").length,
     1,

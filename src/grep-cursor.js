@@ -1,7 +1,7 @@
-export const GREP_CURSOR_VERSION = 4;
+export const GREP_CURSOR_VERSION = 5;
 
 export const GREP_CURSOR_ERROR =
-  "grep cursor is not valid for this search. It is opaque and bound to the same root, pattern, glob, path, regex, fuzzy, context, and ignoreCase as the call that issued it. Pass that cursor back unchanged. A mismatch or a stale cursor is an error, not page 1.";
+  "grep cursor is not valid for this search. It is opaque and bound to the same root, pattern, glob, path, regex, fuzzy, context, ignoreCase, and limit as the call that issued it. Pass that cursor back unchanged. A mismatch or a stale cursor is an error, not page 1.";
 
 export const GREP_COUNT_CURSOR_ERROR =
   "grep count does not accept cursor";
@@ -27,6 +27,7 @@ function payloadFor(search) {
     mode: canonical(search.mode),
     context,
     ignoreCase,
+    limit: canonical(search.limit),
   };
 }
 
@@ -78,6 +79,11 @@ export function openGrepCursor(token, search) {
   }
   const expected = payloadFor(search);
   const window = parsed?.window ?? 0;
+  // A continuation that omits context adopts the cursor's bound value rather
+  // than re-defaulting: context is one of the bound fields, and the default
+  // can drift between the call that issued the cursor and the call that
+  // spends it. An explicit context is still compared.
+  const contextBound = Number.isSafeInteger(search.context);
   if (
     !parsed ||
     typeof parsed !== "object" ||
@@ -88,8 +94,9 @@ export function openGrepCursor(token, search) {
     parsed.constraint !== expected.constraint ||
     parsed.regex !== expected.regex ||
     parsed.fuzzy !== expected.fuzzy ||
-    parsed.context !== expected.context ||
+    (contextBound && parsed.context !== expected.context) ||
     parsed.ignoreCase !== expected.ignoreCase ||
+    parsed.limit !== expected.limit ||
     !Number.isSafeInteger(parsed.offset) ||
     parsed.offset < 0 ||
     !Number.isSafeInteger(window) ||
@@ -99,5 +106,5 @@ export function openGrepCursor(token, search) {
   ) {
     throw new Error(GREP_CURSOR_ERROR);
   }
-  return { mode: parsed.mode, offset: parsed.offset, window };
+  return { mode: parsed.mode, offset: parsed.offset, window, context: parsed.context };
 }

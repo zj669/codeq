@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
+import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
-import { rename, writeFile } from "node:fs/promises";
+import { rename, rm, writeFile } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -22,15 +23,23 @@ import {
   clampGrepContext,
   CONTEXT_CAP,
   COUNT_SCAN_CAP,
+  GREP_CAP,
+  GREP_SCAN_CAP,
+  pageLimit,
   RANK_WINDOW,
 } from "./limits.js";
-import { applyFindWindow, applyGrepWindow } from "./path-tier.js";
+import { applyFindWindow, applyGrepWindow, pathTier } from "./path-tier.js";
 import {
   ensurePrivateDir,
   ensurePrivateFile,
   rootBucket,
 } from "./paths.js";
-import { findSharedGraph, touchGraphSource } from "./graph-share.js";
+import {
+  acquireGraphBuildClaim,
+  findSharedGraph,
+  releaseSupersededGraph,
+  touchGraphSource,
+} from "./graph-share.js";
 import { worktreeFingerprint } from "./worktree.js";
 import { planFindSearch, runFindSearch } from "./find-glob.js";
 
@@ -106,6 +115,7 @@ export class RootContext {
     this.graphWarning = null;
     this.fffWatchFailed = false;
     this.fffWatcherReady = true;
+    this.instance = randomBytes(3).toString("hex");
     this.metadataSequence = 0;
     this.lastSuccessfulSync = null;
     this.finder = null;
@@ -114,6 +124,10 @@ export class RootContext {
     this.graphPending = new Map();
     this.graphSequence = 0;
     this.graphProgressListeners = new Set();
+    // Files the graph watcher saw change but has not synced yet (unioned with
+    // the worker's disk-vs-index diff). Their locators may point at old lines.
+    this.graphStale = new Set();
+    this.stalePollPending = null;
     this.fffUnwatch = null;
     this.fffPromise = this.#initializeFff();
     this.graphPromise = null;
@@ -124,30 +138,39 @@ export class RootContext {
   }
 
   // Other processes parse root.json (index sharing, tests): a torn write
-  // reads as invalid JSON, so publish atomically. The temp name is unique
-  // per call — concurrent touches write and rename independently.
+  // reads as invalid JSON, so publish atomically. The temp name must be
+  // unique per call and per writer: two contexts in this process can write
+  // the same bucket (an evicted root's in-flight publish overlapping its
+  // replacement's first), and a shared pid+sequence collides on the temp
+  // file — the loser of the double rename gets ENOENT and its FFF init dies.
   async #writeMetadata() {
     ensurePrivateDir(this.location.bucket);
-    const temp = `${this.location.metadata}.${process.pid}.${++this.metadataSequence}.tmp`;
-    await writeFile(
-      temp,
-      `${JSON.stringify(
-        {
-          root: this.root,
-          schema: 1,
-          codegraphVersion: "1.6.0",
-          lastAccessedAt: new Date(this.lastAccess).toISOString(),
-          ...(this.graphFingerprint
-            ? { graphFingerprint: this.graphFingerprint }
-            : {}),
-          ...(this.sharedGraph ? { sharedGraphRoot: this.sharedGraph.root } : {}),
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    await rename(temp, this.location.metadata);
-    ensurePrivateFile(this.location.metadata);
+    const temp = `${this.location.metadata}.${process.pid}.${this.instance}.${++this.metadataSequence}.tmp`;
+    try {
+      await writeFile(
+        temp,
+        `${JSON.stringify(
+          {
+            root: this.root,
+            schema: 1,
+            codegraphVersion: "1.6.0",
+            lastAccessedAt: new Date(this.lastAccess).toISOString(),
+            ...(this.graphFingerprint
+              ? { graphFingerprint: this.graphFingerprint }
+              : {}),
+            ...(this.sharedGraph ? { sharedGraphRoot: this.sharedGraph.root } : {}),
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      await rename(temp, this.location.metadata);
+      ensurePrivateFile(this.location.metadata);
+    } catch (error) {
+      // The target stays whole on a failed write; drop our unique temp.
+      await rm(temp, { force: true }).catch(() => {});
+      throw error;
+    }
   }
 
   async #initializeFff() {
@@ -158,7 +181,6 @@ export class RootContext {
       disableWatch: process.env.CODEQ_FFF_DISABLE_WATCH === "1",
     });
     this.finder = unwrap(created, "FFF initialization failed");
-    this.#subscribeFffWatch();
     const scanned = unwrap(
       await this.finder.waitForIndexReady(60_000),
       "FFF initial scan failed",
@@ -166,6 +188,9 @@ export class RootContext {
     if (!scanned) {
       this.fffWarning = "FFF initial scan is still running";
     }
+    // watch() rejects until the first scan completes; subscribing earlier
+    // marked every root watcher-dead, so each query rescan raced the grep.
+    this.#subscribeFffWatch();
     this.#noteFffFreshness(this.finder);
     this.#refreshStatus();
     return this.finder;
@@ -173,16 +198,26 @@ export class RootContext {
 
   #subscribeFffWatch() {
     if (!this.finder?.watch) return;
-    const watched = this.finder.watch((events) => {
-      if (!events?.some((event) => event.kind === "rescan")) return;
-      this.fffWarning = "FFF missed filesystem events and is rescanning";
-      this.#refreshStatus();
-      try {
-        this.finder.scanFiles();
-      } catch {}
-    });
+    let watched;
+    try {
+      watched = this.finder.watch((events) => {
+        if (!events?.some((event) => event.kind === "rescan")) return;
+        this.fffWarning = "FFF missed filesystem events and is rescanning";
+        this.#refreshStatus();
+        try {
+          this.finder.scanFiles();
+        } catch {}
+      });
+    } catch (error) {
+      watched = { ok: false, error: error?.message || String(error) };
+    }
     if (watched.ok) {
       this.fffUnwatch = watched.value;
+      this.fffWatchFailed = false;
+      if (this.fffWarning?.startsWith("FFF watcher failed")) {
+        this.fffWarning = null;
+      }
+      this.#refreshStatus();
       return;
     }
     // No live events: without a rescan the index goes silently stale.
@@ -218,6 +253,11 @@ export class RootContext {
     }
     if (snap.isWatcherReady && !this.lastSuccessfulSync) {
       this.lastSuccessfulSync = new Date().toISOString();
+    }
+    // The first subscribe can run before the watcher arms (slow scans); retry
+    // once fff reports it ready instead of staying in rescan mode forever.
+    if (this.fffWatchFailed && snap.isWatcherReady) {
+      this.#subscribeFffWatch();
     }
   }
 
@@ -273,28 +313,55 @@ export class RootContext {
   // reports ready — queries after that run concurrently.
   async #initializeGraph() {
     const fingerprint = await worktreeFingerprint(this.root);
-    const shared = await findSharedGraph(this.dataDir, {
+    let shared = await findSharedGraph(this.dataDir, {
       root: this.root,
       fingerprint,
       verify: (candidate) => worktreeFingerprint(candidate),
     });
-    const held = await acquireLock(this.location.graphLock, {
-      timeoutMs: GRAPH_LOCK_TIMEOUT_MS,
-      label: `codegraph ${this.root}`,
-    });
+    // Identical worktrees cold-starting together all pass findSharedGraph
+    // before anyone has published. The fingerprint claim serializes the first
+    // build: followers wait here, then re-scan — the winner's bucket is now a
+    // finished source they attach to instead of indexing a second copy. A
+    // finished-but-failed build leaves the claim released with nothing to
+    // share, so the next follower simply takes the claim and retries itself.
+    const claim = fingerprint
+      ? await acquireGraphBuildClaim(this.dataDir, {
+          fingerprint,
+          root: this.root,
+        })
+      : { release: null, waited: false };
+    const waited = claim.waited;
     try {
-      if (shared) {
-        try {
-          return await this.#openGraph(fingerprint, shared);
-        } catch (error) {
-          // The source bucket can be reclaimed or replaced between the match
-          // and the open; build our own index rather than fail the query.
-          this.#teardownGraph(`shared graph unusable: ${error.message}`);
-        }
+      if (waited) {
+        // We queued behind another root's build (or its claim timed out): the
+        // winner's bucket is the one to read now, and a finished-but-failed
+        // build simply finds nothing so we build our own.
+        shared = await findSharedGraph(this.dataDir, {
+          root: this.root,
+          fingerprint,
+          verify: (candidate) => worktreeFingerprint(candidate),
+        });
       }
-      return await this.#openGraph(fingerprint, null);
+      const held = await acquireLock(this.location.graphLock, {
+        timeoutMs: GRAPH_LOCK_TIMEOUT_MS,
+        label: `codegraph ${this.root}`,
+      });
+      try {
+        if (shared) {
+          try {
+            return await this.#openGraph(fingerprint, shared);
+          } catch (error) {
+            // The source bucket can be reclaimed or replaced between the match
+            // and the open; build our own index rather than fail the query.
+            this.#teardownGraph(`shared graph unusable: ${error.message}`);
+          }
+        }
+        return await this.#openGraph(fingerprint, null);
+      } finally {
+        held.release?.();
+      }
     } finally {
-      held.release?.();
+      claim.release?.();
     }
   }
 
@@ -371,6 +438,15 @@ export class RootContext {
           }
           if (message.type === "progress") {
             for (const listener of this.graphProgressListeners) listener(message);
+          } else if (message.type === "stale") {
+            for (const path of message.files || []) this.graphStale.add(path);
+          } else if (message.type === "stale-report") {
+            const pending = this.stalePollPending;
+            if (pending && pending.id === message.id) {
+              this.stalePollPending = null;
+              this.graphStale = new Set(message.files || []);
+              pending.resolve();
+            }
           } else if (message.type === "ready") {
             this.graphReady = true;
             this.lastSuccessfulSync = new Date().toISOString();
@@ -380,13 +456,27 @@ export class RootContext {
             if (!message.watching && !shared) {
               this.graphWarning = "CodeGraph watcher could not be started";
             }
-            void this.#recordGraphFingerprint(fingerprint, shared).catch(
-              () => {},
-            );
+            // Not fire-and-forget: the build claim is only released once the
+            // caller settles, and followers re-scan right after — the bucket
+            // must already advertise the fingerprint they are waiting for.
+            const publish = this.#recordGraphFingerprint(
+              fingerprint,
+              shared,
+            ).catch(() => {});
+            // Only now — the shared worker answered ready — is our own old
+            // database provably redundant; deleting before ready could remove
+            // the only usable index while the share still fails to open.
+            if (shared) {
+              releaseSupersededGraph(shared, this.location.graphDir);
+            }
             this.#refreshStatus();
             if (!settled) {
               settled = true;
-              resolve();
+              // A cold-start follower wakes from the claim the moment the
+              // build finishes and immediately re-scans sources; resolving
+              // before root.json carries the fingerprint would send it off to
+              // build a second index.
+              void publish.finally(resolve);
             }
           } else if (message.type === "sync") {
             this.lastSuccessfulSync = message.at;
@@ -401,6 +491,9 @@ export class RootContext {
             this.graphPending.delete(message.id);
             if (message.error) pending.reject(new Error(message.error));
             else {
+              if (Array.isArray(message.stale)) {
+                this.graphStale = new Set(message.stale);
+              }
               pending.resolve({
                 text: message.result,
                 symbols: Array.isArray(message.symbols) ? message.symbols : [],
@@ -426,6 +519,8 @@ export class RootContext {
     this.sharedGraph = null;
     this.graphFingerprint = null;
     this.graphReady = false;
+    this.graphStale = new Set();
+    this.stalePollPending = null;
     const error = new Error(reason);
     for (const pending of this.graphPending.values()) pending.reject(error);
     this.graphPending.clear();
@@ -457,6 +552,33 @@ export class RootContext {
     await this.startGraphIndex(onProgress);
   }
 
+  // The worker owns the authoritative stale list; ask it for a fresh diff so
+  // a query issued between "file written" and "watcher synced" still marks
+  // that file's locators instead of serving old line numbers as current.
+  #pollGraphStale() {
+    const worker = this.graphProcess;
+    if (!this.graphReady || !worker || worker.exitCode !== null || this.stalePollPending) {
+      return Promise.resolve();
+    }
+    const id = ++this.graphSequence;
+    return new Promise((resolve) => {
+      this.stalePollPending = { id, resolve };
+      try {
+        worker.stdin.write(`${JSON.stringify({ id, command: "stale" })}\n`);
+      } catch {
+        this.stalePollPending = null;
+        resolve();
+        return;
+      }
+      setTimeout(() => {
+        if (this.stalePollPending?.id === id) {
+          this.stalePollPending = null;
+          resolve();
+        }
+      }, 500).unref();
+    });
+  }
+
   metadata() {
     if (this.finder) this.#noteFffFreshness(this.finder);
     this.#refreshStatus();
@@ -466,12 +588,14 @@ export class RootContext {
       fffWarning: this.fffWarning,
       graphWarning: this.graphWarning,
       lastSuccessfulSync: this.lastSuccessfulSync,
+      stalePaths: [...this.graphStale],
     };
   }
 
   async find(query, options) {
     const finder = await this.fffPromise;
     this.#rescanIfWatcherDown();
+    await this.#pollGraphStale();
     const plan = planFindSearch(query, options.constraint);
     const { value, globFallback } = runFindSearch(plan, (needle) =>
       unwrap(
@@ -505,13 +629,16 @@ export class RootContext {
     const mode = assertGrepPattern(pattern, { regex });
     const finder = await this.fffPromise;
     this.#rescanIfWatcherDown();
+    await this.#pollGraphStale();
     const constraints = [];
     if (options.constraint) constraints.push(options.constraint);
     if (options.glob) constraints.push(options.glob);
     const query = [...constraints, pattern].join(" ");
-    const context = clampGrepContext(options.context);
-    const contextCapped =
-      Number.isSafeInteger(options.context) && options.context > CONTEXT_CAP;
+    // A continuation call that omits context defers to the cursor's bound
+    // value; see openGrepCursor. Clamp happens after that resolution.
+    const contextRequested = Number.isSafeInteger(options.context);
+    let context = clampGrepContext(options.context);
+    const contextCapped = contextRequested && options.context > CONTEXT_CAP;
     const ignoreCaseBound = ignoreCaseCursorValue(options.ignoreCase);
     const search = {
       root: this.root,
@@ -520,8 +647,11 @@ export class RootContext {
       constraint: options.constraint || "",
       regex,
       fuzzy: fuzzyRequested,
-      context,
+      // Unresolved until the cursor path runs: an omitted context stays
+      // non-integer so openGrepCursor can adopt the token's bound value.
+      context: contextRequested ? context : options.context,
       ignoreCase: ignoreCaseBound,
+      limit: options.limit,
     };
     if (options.count) {
       if (options.cursor) throw new Error(GREP_COUNT_CURSOR_ERROR);
@@ -547,6 +677,12 @@ export class RootContext {
       grepOptions.mode = opened.mode;
       windowStart = opened.window;
       rankedOffset = opened.offset;
+      if (!contextRequested) {
+        context = clampGrepContext(opened.context);
+        search.context = context;
+        grepOptions.beforeContext = context;
+        grepOptions.afterContext = context;
+      }
       if (windowStart > 0) grepOptions.cursor = toFffCursor(windowStart);
     }
     let value = unwrap(finder.grep(query, grepOptions), "FFF content search failed");
@@ -570,15 +706,54 @@ export class RootContext {
       if (fuzzy.items.length > 0) {
         value = fuzzy;
         usedFuzzy = true;
+        // Deeper pages must follow the fuzzy stream's own cursor offsets.
+        grepOptions.mode = "fuzzy";
       }
     }
-    const mapped = value.items.map(mapGrepHit);
+    // Ranking happens after collection, so the pool must reach the production
+    // hits: FFF serves docs first, and a single RANK_WINDOW page can hold none.
+    // Keep fetching while production hits are still arriving — stop once a
+    // whole page passes without one, or at the scan cap.
+    const mapped = [];
+    let tier0Hits = 0;
+    let sinceTier0 = 0;
+    let fffNext = null;
+    const collect = (batch) => {
+      for (const item of batch.items) {
+        if (pathTier(item.relativePath) === 0) {
+          tier0Hits += 1;
+          sinceTier0 = 0;
+        } else {
+          sinceTier0 += 1;
+        }
+        mapped.push(mapGrepHit(item));
+      }
+      fffNext = grepCursorOffset(batch.nextCursor);
+    };
+    collect(value);
+    const pageSize = pageLimit(options.limit, RANK_WINDOW, GREP_CAP);
+    while (
+      Number.isSafeInteger(fffNext) &&
+      fffNext > 0 &&
+      mapped.length < GREP_SCAN_CAP
+    ) {
+      const more = unwrap(
+        finder.grep(query, { ...grepOptions, cursor: toFffCursor(fffNext) }),
+        "FFF content search failed",
+      );
+      collect(more);
+      if (more.items.length === 0) break;
+      if (tier0Hits >= pageSize && sinceTier0 >= RANK_WINDOW) break;
+    }
     const { ranked, page } = applyGrepWindow(
       mapped,
       pattern,
       options.limit,
       rankedOffset,
     );
+    for (const hit of page) {
+      if (this.graphStale.has(hit.path)) hit.stale = true;
+    }
     const pageMode = usedFuzzy ? "fuzzy" : grepOptions.mode;
     const nextCursor = encodeNextGrepCursor(
       { ...search, mode: pageMode },
@@ -587,7 +762,7 @@ export class RootContext {
         offset: rankedOffset,
         pageLength: page.length,
         windowStart,
-        fffNextOffset: grepCursorOffset(value.nextCursor),
+        fffNextOffset: fffNext,
       },
     );
     return {
@@ -597,6 +772,11 @@ export class RootContext {
       regex,
       fuzzyRequested,
       shown: page.length,
+      // Ranked-pool size known so far: lower bound on the true total while
+      // FFF still has hits, exact once it does not. The formatter prefers it
+      // over shown so a truncated page can say "16/48 shown".
+      total: ranked.length,
+      rankedExhausted: !Number.isSafeInteger(fffNext) || fffNext <= 0,
       nextCursor,
       results: page,
       context,
@@ -674,6 +854,19 @@ export class RootContext {
   }
 
   async explore(query, options, onProgress) {
+    if (options?.wait === false && !this.graphReady) {
+      // Opt-in non-blocking: a cold graph call normally stalls for the whole
+      // index build. wait:false starts the build and answers provisionally —
+      // the same call without wait still blocks until ready.
+      this.startGraphIndex(onProgress).catch(() => {});
+      return {
+        ...this.metadata(),
+        query,
+        constraint: options.constraint || null,
+        result: "",
+        symbols: [],
+      };
+    }
     await this.startGraphIndex(onProgress);
     if (this.sharedGraph) await this.#revalidateSharedGraph(onProgress);
     const scoped = options.constraint

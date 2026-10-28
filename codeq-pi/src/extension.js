@@ -13,6 +13,7 @@ import {
   EMPTY_TOOL_MENU,
   requireGrepRegex,
 } from "@zj669/codeq/src/mcp-format.js";
+import { GREP_CONTEXT_DEFAULT } from "@zj669/codeq/src/limits.js";
 
 const PATH_DESCRIPTION =
   "Narrow this call inside the selected root; never selects an index. Relative paths are relative to that root.";
@@ -21,13 +22,13 @@ const ROOT_DESCRIPTION =
   "Repository/checkout/worktree for this call; overrides cwd/Git detection. Set it for cross-repo/worktree queries.";
 
 const FIND_DESCRIPTION =
-  "codeq fuzzy file/path lookup, including dotfiles — not Pi's builtin fd. Query is a path fragment, not a glob. If you already know the directory and filename, Read it; do not find to confirm.";
+  "Pick this when you have a file name or path fragment and need its real path — codeq fuzzy file/path lookup, including dotfiles, not Pi's builtin fd. Query is a path fragment, not a glob. If you already know the directory and filename, Read it; do not find to confirm.";
 
 const GREP_DESCRIPTION =
-  "codeq content search; this is not rg and not Pi's builtin rg. regex is required: false for a literal string, true for a regular expression. Pass fuzzy:true for approximate/different identifiers. Need nearby source for a hit, pass context (at most 3); this is not rg and not host Read. After locators are returned, do not Read hit files whole, and do not find that basename. Returns matching lines.";
+  "codeq content search; this is not rg and not Pi's builtin rg. regex is required: false for a literal string, true for a regular expression. Pass fuzzy:true for approximate/different identifiers. Each hit shows one neighbor line by default; pass context (at most 3) for more, 0 for locators only; this is not rg and not host Read. After locators are returned, do not Read hit files whole, and do not find that basename. Returns matching lines.";
 
 const GRAPH_DESCRIPTION =
-  "codeq graph: identifiers, or a short question about how X works, where X is defined, or who calls / uses X. Returns an entry span, direct callees, and direct callers — a map, not an answer or source. The how-it-works entry span plus direct neighborhood is the locate; if you still Read, Read only that span, not the whole file; do not then find or grep the same name. For who-calls or where-used, use the callers locators; do not grep that name first. Bounded neighborhood, not an exhaustive callgraph. There is no callers tool.";
+  "codeq graph: pick this when the question names a symbol — an identifier, or a short question about how X works, where X is defined, or who calls / uses X; it answers these in one call where grep would take several. Returns an entry span, direct callees, and direct callers — a map, not an answer or source. The how-it-works entry span plus direct neighborhood is the locate; if you still Read, Read only that span, not the whole file; do not then find or grep the same name. For who-calls or where-used, use the callers locators; do not grep that name first. Bounded neighborhood, not an exhaustive callgraph. There is no callers tool.";
 
 function pathField() {
   return Type.Optional(Type.String({ description: PATH_DESCRIPTION }));
@@ -142,6 +143,8 @@ function toolRequest(name, params, cwd) {
     }
     if (params.context !== undefined) {
       request.context = positiveInteger(params.context, "context", true);
+    } else if (params.count !== true && params.cursor === undefined) {
+      request.context = GREP_CONTEXT_DEFAULT;
     }
     if (params.count !== undefined) request.count = Boolean(params.count);
     if (params.ignoreCase !== undefined) {
@@ -445,7 +448,7 @@ export function createCodeqExtension({
       promptGuidelines: [
         CODEQ_BEFORE_BASH_GUIDELINE,
         "find is codeq path search, not a glob tool and not fd: pass profile, not **/*profile*.",
-        "find: if you already know the directory and filename, Read it; do not find to confirm.",
+        "find: if you already know the directory and filename, Read it; do not find to confirm. Returned paths are repo-relative — join them to the root on the reply's first line for host Read, or pass one to grep path:.",
         "find matches the whole indexed path, including dotfiles such as .cursor/rules. Use grep for contents and graph for call chains.",
         "find searches one repository per call. Pass root for another checkout; pass path to narrow inside the selected root. Never merge results across repositories.",
       ],
@@ -511,7 +514,7 @@ export function createCodeqExtension({
           Type.Integer({
             minimum: 0,
             description:
-              "Neighboring source lines around each hit. Default 0, maximum 3. Not rg and not host Read.",
+              "Neighboring source lines around each hit. Default 1, maximum 3; pass 0 for locators only. Not rg and not host Read.",
           }),
         ),
         count: Type.Optional(
@@ -541,7 +544,7 @@ export function createCodeqExtension({
       promptSnippet: "Explore the code graph (codeq / CodeGraph)",
       promptGuidelines: [
         CODEQ_BEFORE_BASH_GUIDELINE,
-        "graph is codeq CodeGraph explore, not a written answer. Query identifiers, how X works, where X is defined, or who calls / uses X — not a multi-paragraph question.",
+        "graph is codeq CodeGraph explore, not a written answer. Pick it when the question names a symbol — identifiers, how X works, where X is defined, or who calls / uses X — not a multi-paragraph question. A 'who calls X' or 'how does X work' question goes to graph first, not grep.",
         "graph: the how-it-works entry span plus direct neighborhood is the locate; if you still Read, Read only that span, not the whole file; do not then find or grep the same name. For who-calls or where-used, use the callers locators; do not grep that name first. There is no callers tool.",
         "graph searches one repository per call. Pass root for another checkout; pass path to narrow. Replies are locators, never source.",
       ],

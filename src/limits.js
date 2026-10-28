@@ -1,6 +1,10 @@
 export const FIND_CAP = 16;
 export const GREP_CAP = 16;
 export const RANK_WINDOW = 48;
+// Grep ranking only sees the hits fetched so far, and FFF orders docs before
+// production, so a 48-hit window can be all docs. Keep fetching while
+// production hits are still arriving, up to this many hits total.
+export const GREP_SCAN_CAP = 2048;
 export const ENTRY_CAP = 3;
 export const CALLEE_CAP = 4;
 export const CALLER_CAP = 4;
@@ -13,6 +17,10 @@ export const JEV_TIMEOUT_MS = 800;
 export const JEV_CANDIDATE_CAP = 16;
 export const MATCH_TEXT_CHARS = 200;
 export const CONTEXT_CAP = 3;
+// One neighbor line is the default: transcript review shows agents re-grep on
+// the host when a hit is a bare line they cannot judge. context: 0 stays
+// available for locator-only output; the cap keeps the reply bounded.
+export const GREP_CONTEXT_DEFAULT = 1;
 export const COUNT_SCAN_CAP = 4096;
 export const SIDECAR_WINDOW = 40;
 export const SIDECAR_MAX_BYTES = 64 * 1024;

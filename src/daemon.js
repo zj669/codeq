@@ -59,13 +59,22 @@ async function persistRegistry() {
     })),
   };
   const stamp = `${process.pid}.${registrySequence += 1}`;
-  await writeFile(`${paths.packageVersion}.${stamp}.tmp`, `${version}\n`);
-  await rename(`${paths.packageVersion}.${stamp}.tmp`, paths.packageVersion);
-  await writeFile(
-    `${paths.registry}.${stamp}.tmp`,
-    `${JSON.stringify(value, null, 2)}\n`,
-  );
-  await rename(`${paths.registry}.${stamp}.tmp`, paths.registry);
+  await publishFile(paths.packageVersion, `${version}\n`, stamp);
+  await publishFile(paths.registry, `${JSON.stringify(value, null, 2)}\n`, stamp);
+}
+
+// Cross-process readers (client.js daemonPid/stopDaemon, root.json consumers)
+// can open these mid-write; publish atomically (temp + rename). A failed or
+// killed write leaves only its unique temp — the target stays whole.
+async function publishFile(path, body, stamp = `${process.pid}.${registrySequence += 1}`) {
+  const temp = `${path}.${stamp}.tmp`;
+  try {
+    await writeFile(temp, body);
+    await rename(temp, path);
+  } catch (error) {
+    await rm(temp, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 function injectGraphDir(root) {
@@ -104,7 +113,10 @@ function pruneDiskIndexes() {
 async function waitForSlot() {
   while (roots.size >= ROOT_LIMIT) {
     const candidate = [...roots.values()]
-      .filter((entry) => entry.active === 0)
+      // A root still building its first index has no settled state to fall
+      // back on: evicting it mid-scan rejects its in-flight query and, if it
+      // rejects before a caller attaches, crashes this process on Node 22+.
+      .filter((entry) => entry.active === 0 && entry.settled)
       .sort((a, b) => a.lastAccess - b.lastAccess)[0];
     if (candidate) {
       // Memory only: dispose drops FFF + the graph worker. The on-disk
@@ -122,26 +134,57 @@ async function waitForSlot() {
 // waitForSlot yields, so two cold requests for the same root used to build two
 // RootContexts — two graph workers migrating one database. The promise is
 // registered before the first await, so the second request joins the first.
+// .finally alone would leave a floating rejection when the open fails; the
+// catch below keeps one process alive when a burst of new roots arrives.
 async function contextFor(root) {
   const existing = roots.get(root);
   if (existing) {
     existing.touch();
-    return existing;
+    return { context: existing, queued: false, release: null };
   }
   const pending = opening.get(root);
   if (pending) return pending;
   const creating = (async () => {
+    const queued = roots.size >= ROOT_LIMIT;
     await waitForSlot();
     injectGraphDir(root);
     const context = new RootContext(root, paths.base);
+    // Guarded until the first scan settles AND the opener has begun a query:
+    // waitForSlot only evicts settled roots, and release() (run inside the
+    // opener's context.use) keeps active>0 across the creation gap, so a
+    // concurrent burst can never destroy a root whose scan is still owned.
+    let released = false;
+    let settled = false;
+    let inUse = false;
+    const release = () => {
+      if (released || !settled || !inUse) return;
+      released = true;
+      context.active -= 1;
+    };
+    context.active += 1;
+    context.fffPromise.finally(() => {
+      settled = true;
+      context.settled = true;
+      release();
+    });
+    context.fffPromise.catch(() => {});
     roots.set(root, context);
     context.startGraphIndex().catch(() => {});
     await persistRegistry();
     pruneDiskIndexes();
-    return context;
-  })().finally(() => opening.delete(root));
-  opening.set(root, creating);
-  return creating;
+    return {
+      context,
+      queued,
+      release: () => {
+        inUse = true;
+        release();
+      },
+    };
+  })();
+  const tracked = creating.finally(() => opening.delete(root));
+  tracked.catch(() => {});
+  opening.set(root, tracked);
+  return tracked;
 }
 
 function send(socket, message) {
@@ -153,10 +196,13 @@ function send(socket, message) {
 async function execute(request, socket) {
   lastRequestAt = Date.now();
   const routed = await resolveRequestRoot(request);
-  const context = await contextFor(routed.root);
+  const { context, queued, release } = await contextFor(routed.root);
   const progress = (value) => send(socket, { type: "progress", ...value });
 
   const result = await context.use(async () => {
+    // The opener's reservation only releases once this query itself holds
+    // active>0, closing the gap waitForSlot would otherwise race.
+    release?.();
     if (request.command === "find") {
       return context.find(request.query, {
         constraint: routed.constraint,
@@ -167,7 +213,9 @@ async function execute(request, socket) {
       return context.grep(request.query, {
         constraint: routed.constraint,
         glob: request.glob,
-        context: request.context ?? 0,
+        // Omit means "not requested": clampGrepContext maps it to 0 for a
+        // plain search, and a cursor call adopts the token's bound value.
+        context: request.context,
         limit: request.limit,
         fuzzy: Boolean(request.fuzzy),
         regex: Boolean(request.regex),
@@ -180,7 +228,7 @@ async function execute(request, socket) {
       progress({ phase: "graph", message: `querying ${routed.root}` });
       return context.explore(
         request.query,
-        { constraint: routed.constraint },
+        { constraint: routed.constraint, wait: request.wait },
         progress,
       );
     }
@@ -191,6 +239,10 @@ async function execute(request, socket) {
     ...result,
     rootSource: routed.source,
     rootNote: routed.note,
+    // A burst of distinct roots saturates the live pool: the reply still
+    // answers, but the caller should know this root waited for a slot and its
+    // index may be fresh rather than shared. One root per call stays the rule.
+    poolBusy: queued,
     cwdSource: CWD_SOURCES.has(request.cwdSource) ? request.cwdSource : null,
   };
 }
@@ -265,9 +317,6 @@ try {
     if (process.platform !== "win32" && existsSync(paths.socket)) {
       await rm(paths.socket, { force: true });
     }
-    // Stamp the package version before the socket exists so a client that sees
-    // a live socket can tell this process from an older daemon.
-    await writeFile(paths.packageVersion, `${version}\n`);
     await new Promise((resolve, reject) => {
       const onError = (error) => reject(error);
       server.once("error", onError);
@@ -276,7 +325,7 @@ try {
         resolve();
       });
     });
-    await writeFile(paths.pid, `${process.pid}\n`);
+    await publishFile(paths.pid, `${process.pid}\n`);
     await persistRegistry();
   }
 } catch (error) {

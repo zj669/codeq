@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { queryDaemon } from "../src/client.js";
+import { GREP_CONTEXT_DEFAULT } from "../src/limits.js";
 import { formatMcpToolResult, freshnessLine } from "../src/mcp-format.js";
 import { runMcpServer } from "../src/mcp.js";
 import { maybeRerank } from "../src/jev.js";
@@ -8,7 +9,7 @@ import { maybeRerank } from "../src/jev.js";
 const USAGE = `Usage:
   codeq [--root PATH] [--json] find  <query>   [--path PATH] [--limit N]
   codeq [--root PATH] [--json] grep  <pattern> [--path PATH] [--glob GLOB] [--context N] [--limit N] [--count] [--ignore-case] [--case-sensitive] [--regex] [--fuzzy] [--cursor TOKEN]
-  codeq [--root PATH] [--json] graph <query>   [--path PATH]
+  codeq [--root PATH] [--json] graph <query>   [--path PATH] [--no-wait]
   codeq mcp
 
 Human output is the locator map the MCP tools return: the resolved root on
@@ -102,6 +103,11 @@ function parseArguments(argv) {
       options.fuzzy = true;
       continue;
     }
+    if (arg === "--no-wait") {
+      if (command !== "graph") fail("--no-wait is not valid for " + command);
+      options.wait = false;
+      continue;
+    }
     if (arg === "--regex") {
       if (command !== "grep") fail("--regex is not valid for " + command);
       options.regex = true;
@@ -143,6 +149,12 @@ function parseArguments(argv) {
   }
   if (options.context !== undefined) {
     options.context = positiveInteger(options.context, "--context", true);
+  } else if (
+    command === "grep" &&
+    options.count !== true &&
+    options.cursor === undefined
+  ) {
+    options.context = GREP_CONTEXT_DEFAULT;
   }
   return options;
 }

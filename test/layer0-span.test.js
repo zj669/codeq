@@ -359,6 +359,55 @@ function fakeGraph(nodes, { throwOnName = null } = {}) {
   return graph;
 }
 
+test("graphSearch resolves an identifier that is also an English word", async () => {
+  const path = {
+    id: "path",
+    kind: "class",
+    name: "Path",
+    filePath: "src/pkg/params.py",
+    startLine: 140,
+    endLine: 223,
+    outgoing: [],
+    incoming: [],
+  };
+  const use = {
+    id: "use",
+    kind: "function",
+    name: "use",
+    filePath: "src/pkg/view.py",
+    startLine: 7,
+    endLine: 8,
+    outgoing: [],
+    incoming: [],
+  };
+  const graph = fakeGraph([path, use]);
+  // A bare stop-word query has no prose to strip: the token IS the symbol.
+  const bare = await graphSearch(graph, "Path", async () => {
+    throw new Error("explore should not run for a resolved bare identifier");
+  });
+  assert.equal(bare.result, "");
+  assert.equal(bare.symbols.length, 1);
+  assert.equal(bare.symbols[0].name, "Path");
+  assert.equal(bare.symbols[0].path, "src/pkg/params.py");
+
+  // Prose around the symbol still resolves it: "who calls Path" must pin Path,
+  // not drop it as a stop word and return an empty symbol list.
+  const asked = await graphSearch(graph, "who calls Path", async () =>
+    "Found 0 symbols across 0 files.\n",
+  );
+  assert.equal(
+    asked.symbols.some((span) => span.name === "Path"),
+    true,
+  );
+  const useResult = await graphSearch(graph, "how does use work", async () =>
+    "Found 0 symbols across 0 files.\n",
+  );
+  assert.equal(
+    useResult.symbols.some((span) => span.name === "use"),
+    true,
+  );
+});
+
 test("graphSearch skips explore when every identifier has an exact-name definition", async () => {
   const paint = {
     id: "paint",
@@ -404,7 +453,9 @@ test("graphSearch skips explore when every identifier has an exact-name definiti
     result.symbols[0].callers.map((caller) => caller.name),
     ["show"],
   );
-  assert.deepEqual(graph.named, ["render_widget"]);
+  // Prose words are resolved too — a stop word that names a real symbol still
+  // deserves a lookup; the skip-explore gate is what stays on the primary set.
+  assert.deepEqual(graph.named, ["render_widget", "how", "does", "work"]);
   assert.equal(identifiersHaveExactDefs(graph, "how does render_widget work"), true);
 });
 
@@ -431,7 +482,13 @@ test("graphSearch explores when any identifier lacks an exact-name definition", 
   assert.deepEqual(seen, ["how does render_widget missing_identifier work"]);
   assert.equal(mixed.result, "Found 0 symbols across 0 files.\n");
   assert.equal(mixed.symbols.some((span) => span.name === "render_widget"), true);
-  assert.deepEqual(graph.named, ["render_widget", "missing_identifier"]);
+  assert.deepEqual(graph.named, [
+    "render_widget",
+    "missing_identifier",
+    "how",
+    "does",
+    "work",
+  ]);
   assert.equal(identifiersHaveExactDefs(graph, "how does missing_identifier work"), false);
 
   seen.length = 0;

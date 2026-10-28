@@ -4,6 +4,7 @@ import {
   formatMcpToolResult,
   freshnessLine,
   GREP_REGEX_REQUIRED,
+  INDEX_NOT_READY_NOTE,
   requireGrepRegex,
   rootOrigin,
   CALLEE_CAP,
@@ -17,6 +18,10 @@ import {
 } from "../src/mcp-format.js";
 import { parseExploreDump, queryIdentifiers } from "../src/graph-map.js";
 import { GIANT_SPAN_LINES, MEMBER_CAP } from "../src/limits.js";
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 test("grep regex must be a boolean; omit is not a literal default", () => {
   assert.equal(requireGrepRegex(true), true);
@@ -430,6 +435,7 @@ test("grep is exact by default and never labels itself fuzzy", () => {
     line: 4,
     column: 1,
     text: "export function createSession() {}",
+    read: { path: "src/app.ts", offset: 1, limit: 11 },
   });
 });
 
@@ -498,11 +504,261 @@ test("grep reports a real nextCursor instead of a fake total", () => {
       text: "reply_success()",
     })),
   });
-  assert.match(formatted.text, /grep reply_success — 16 shown, more remain/);
-  assert.match(formatted.text, /more: next page available/);
+  assert.match(formatted.text, /grep reply_success — 16\/\? shown, more remain/);
+  assert.match(formatted.text, /truncated — continue once now/);
   assert.equal(formatted.text.includes("cursor=abc"), false);
   assert.equal(formatted.structuredContent.truncated, true);
   assert.equal(formatted.structuredContent.nextCursor, "abc");
+  assert.deepEqual(formatted.structuredContent.truncation, {
+    shown: 16,
+    next: "pass nextCursor as cursor",
+    retry: { cursor: "abc" },
+  });
+});
+
+test("truncated replies carry a machine-readable way to continue", () => {
+  // find: total known, continuation = raise the page toward the cap.
+  const find = formatMcpToolResult("find", {
+    status: "ready",
+    root: "/repo",
+    query: "test",
+    total: 40,
+    results: Array.from({ length: 16 }, (_, i) => ({
+      path: `tests/t${i}.py`,
+    })),
+    requestedLimit: null,
+    pageCap: 48,
+  });
+  assert.match(find.text, /find test — 16\/40 matches/);
+  assert.match(find.text, /truncated — continue once now/);
+  assert.deepEqual(find.structuredContent.truncation, {
+    shown: 16,
+    total: 40,
+    remaining: 24,
+    next: "raise limit toward 48, or narrow with path",
+    retry: { limit: 48 },
+  });
+
+  // find with the page cap already hit: the lever is scoping path: to a
+  // directory that already holds hits.
+  const findCapped = formatMcpToolResult("find", {
+    status: "ready",
+    root: "/repo",
+    query: "test",
+    total: 100,
+    results: Array.from({ length: 48 }, (_, i) => ({
+      path: `tests/t${i}.py`,
+    })),
+    requestedLimit: 100,
+    pageCap: 48,
+  });
+  assert.match(findCapped.text, /capped at 48; truncated — continue once now/);
+  assert.equal(findCapped.structuredContent.truncation.next, "narrow with path (limit is at the page cap)");
+  assert.deepEqual(findCapped.structuredContent.truncation.retry, {
+    path: "tests",
+  });
+
+  // grep: pool exhausted under the cap — the total is exact, the retry is the
+  // opaque cursor.
+  const grepExact = formatMcpToolResult("grep", {
+    status: "ready",
+    root: "/repo",
+    pattern: "status_code",
+    mode: "plain",
+    nextCursor: "abc",
+    total: 20,
+    rankedExhausted: true,
+    results: Array.from({ length: 16 }, (_, i) => ({
+      path: `src/f${i}.py`,
+      line: i + 1,
+      column: 1,
+      text: "status_code",
+    })),
+  });
+  assert.match(grepExact.text, /grep status_code — 16\/20 shown, more remain/);
+  assert.deepEqual(grepExact.structuredContent.truncation, {
+    shown: 16,
+    total: 20,
+    remaining: 4,
+    next: "pass nextCursor as cursor",
+    retry: { cursor: "abc" },
+  });
+
+  // graph: hidden neighborhood sections carry their counts, and the retry is
+  // the first omitted name — itself a directly graphable identifier.
+  const callees = Array.from({ length: 8 }, (_, i) => ({
+    name: `step${i}`,
+    path: `src/step${i}.py`,
+    line: i + 1,
+  }));
+  const graph = formatMcpToolResult("graph", {
+    ...graphResult,
+    symbols: [
+      {
+        name: "createSession",
+        kind: "function",
+        path: "src/session.ts",
+        startLine: 12,
+        endLine: 40,
+        callees,
+      },
+    ],
+  });
+  assert.equal(graph.structuredContent.truncated, true);
+  assert.match(graph.text, /\+4 callees omitted/);
+  assert.deepEqual(graph.structuredContent.truncation, {
+    shown: 4,
+    remaining: 4,
+    omitted: { callees: 4 },
+    next: "graph an omitted name, or add path: under the entry's own directory",
+    retry: { query: "step4" },
+  });
+});
+
+test("untruncated replies carry no truncation object", () => {
+  for (const formatted of [
+    formatMcpToolResult("find", {
+      status: "ready",
+      root: "/repo",
+      query: "app",
+      total: 1,
+      results: [{ path: "src/app.ts" }],
+    }),
+    formatMcpToolResult("grep", {
+      status: "ready",
+      root: "/repo",
+      pattern: "needle",
+      mode: "plain",
+      results: [{ path: "src/a.ts", line: 1, column: 1, text: "needle" }],
+    }),
+    formatMcpToolResult("graph", graphResult),
+  ]) {
+    assert.equal(formatted.structuredContent.truncated, false);
+    assert.equal("truncation" in formatted.structuredContent, false);
+  }
+});
+
+test("a narrowed repeat query drops the truncation signal", () => {
+  // The continue-signal contract: path/glob narrows the same query until the
+  // page is whole — then truncated flips false and truncation is gone.
+  const wide = formatMcpToolResult("grep", {
+    status: "ready",
+    root: "/repo",
+    pattern: "status_code",
+    mode: "plain",
+    nextCursor: "abc",
+    results: Array.from({ length: 16 }, (_, i) => ({
+      path: `src/f${i}.py`,
+      line: i + 1,
+      column: 1,
+      text: "status_code",
+    })),
+  });
+  assert.equal(wide.structuredContent.truncated, true);
+  assert.deepEqual(wide.structuredContent.truncation.retry, { cursor: "abc" });
+
+  const narrowed = formatMcpToolResult("grep", {
+    status: "ready",
+    root: "/repo",
+    pattern: "status_code",
+    mode: "plain",
+    constraint: "src/",
+    nextCursor: null,
+    results: [
+      { path: "src/f0.py", line: 1, column: 1, text: "status_code" },
+      { path: "src/f1.py", line: 2, column: 1, text: "status_code" },
+    ],
+  });
+  assert.match(narrowed.text, /grep status_code — 2 matches in 2 files/);
+  assert.equal(narrowed.structuredContent.truncated, false);
+  assert.equal("truncation" in narrowed.structuredContent, false);
+
+  const findNarrowed = formatMcpToolResult("find", {
+    status: "ready",
+    root: "/repo",
+    query: "test",
+    constraint: "tests/api/",
+    total: 3,
+    results: [
+      { path: "tests/api/a.py" },
+      { path: "tests/api/b.py" },
+      { path: "tests/api/c.py" },
+    ],
+  });
+  assert.match(findNarrowed.text, /find test — 3 matches/);
+  assert.equal(findNarrowed.structuredContent.truncated, false);
+  assert.equal("truncation" in findNarrowed.structuredContent, false);
+});
+
+test("an unfinished index marks every reply provisional instead of a bare miss", () => {
+  for (const status of ["indexing", "degraded"]) {
+    const base = {
+      status,
+      root: "/repo",
+      fffWarning: status === "degraded" ? "FFF watcher failed" : null,
+      graphWarning: null,
+      lastSuccessfulSync: "2026-09-21T10:00:00.000Z",
+    };
+    const find = formatMcpToolResult("find", {
+      ...base,
+      query: "app",
+      total: 0,
+      results: [],
+    });
+    assert.match(find.text, /0 matches/);
+    assert.match(find.text, new RegExp(INDEX_NOT_READY_NOTE));
+    assert.equal(find.structuredContent.indexReady, false);
+
+    const grep = formatMcpToolResult("grep", {
+      ...base,
+      pattern: "needle",
+      mode: "plain",
+      results: [],
+    });
+    assert.match(grep.text, /0 matches/);
+    assert.match(grep.text, new RegExp(INDEX_NOT_READY_NOTE));
+    assert.equal(grep.structuredContent.indexReady, false);
+
+    const graph = formatMcpToolResult("graph", {
+      ...base,
+      query: "createSession",
+      result: "",
+      symbols: [],
+    });
+    assert.match(graph.text, /NO exact hit/);
+    assert.match(graph.text, new RegExp(INDEX_NOT_READY_NOTE));
+    assert.equal(graph.structuredContent.indexReady, false);
+  }
+});
+
+test("a ready index omits the provisional marker and reports indexReady", () => {
+  for (const command of ["find", "grep", "graph"]) {
+    const formatted = formatMcpToolResult(command, {
+      status: "ready",
+      root: "/repo",
+      query: "app",
+      pattern: "app",
+      total: 0,
+      results: [],
+      result: "",
+      symbols: [],
+    });
+    assert.equal(formatted.text.includes(INDEX_NOT_READY_NOTE), false);
+    assert.equal(formatted.structuredContent.indexReady, true);
+  }
+});
+
+test("a ready index with a real miss stays a bare miss", () => {
+  const formatted = formatMcpToolResult("grep", {
+    status: "ready",
+    root: "/repo",
+    pattern: "needle",
+    mode: "plain",
+    results: [],
+  });
+  assert.match(formatted.text, /grep needle — 0 matches/);
+  assert.equal(formatted.text.includes(INDEX_NOT_READY_NOTE), false);
+  assert.equal(formatted.structuredContent.indexReady, true);
 });
 
 test("find replies are paths, not file metadata", () => {
@@ -666,7 +922,7 @@ test("find truncation does not mention the page cap", () => {
     results: Array.from({ length: 16 }, (_, i) => ({ path: `src/f${i}.ts` })),
   });
   assert.match(formatted.text, /find test — 16\/84 matches/);
-  assert.match(formatted.text, /more: refine query\/path/);
+  assert.match(formatted.text, /truncated — continue once now/);
   assert.equal(formatted.text.includes("capped at 16"), false);
 });
 
@@ -841,6 +1097,10 @@ test("graph does not promote relation-only or out-of-scope same-name nodes", () 
   );
 });
 
+// Extra definitions sort by the same tier order as callers (production, test,
+// bench, docs, config): with the old binary test/non-test split, a docs snippet
+// or CI mention counted as "production" and could win an ENTRY_CAP slot by
+// path order ahead of real source.
 test("graph keeps multiple same-name definitions and deprioritizes tests", () => {
   const formatted = formatMcpToolResult("graph", {
     ...graphResult,
@@ -862,6 +1122,74 @@ test("graph keeps multiple same-name definitions and deprioritizes tests", () =>
         path: "src/b.py",
         startLine: 8,
         endLine: 12,
+        callees: [],
+        callers: [],
+      },
+      {
+        name: "dispatch",
+        kind: "function",
+        path: "src/a.py",
+        startLine: 3,
+        endLine: 9,
+        callees: [],
+        callers: [],
+      },
+    ],
+  });
+  assert.deepEqual(
+    formatted.structuredContent.entries.map((entry) => entry.path),
+    ["src/a.py", "src/b.py", "test/dispatch_test.py"],
+  );
+});
+
+test("graph definition ranking puts docs and config below tests and benchmarks", () => {
+  const formatted = formatMcpToolResult("graph", {
+    ...graphResult,
+    query: "dispatch",
+    result: "Found 0 symbols across 0 files.\n",
+    symbols: [
+      {
+        name: "dispatch",
+        kind: "function",
+        path: "docs/tutorial/intro.py",
+        startLine: 3,
+        endLine: 9,
+        callees: [],
+        callers: [],
+      },
+      {
+        name: "dispatch",
+        kind: "function",
+        path: ".github/workflows/ci.yml",
+        startLine: 5,
+        endLine: 5,
+        callees: [],
+        callers: [],
+      },
+      {
+        name: "dispatch",
+        kind: "function",
+        path: "tests/benchmarks/utils.py",
+        startLine: 11,
+        endLine: 46,
+        callees: [],
+        callers: [],
+      },
+      {
+        name: "dispatch",
+        kind: "function",
+        path: "src/b.py",
+        startLine: 8,
+        endLine: 12,
+        callees: [],
+        callers: [],
+      },
+      {
+        name: "dispatch",
+        kind: "function",
+        path: "test/dispatch_test.py",
+        startLine: 1,
+        endLine: 4,
         callees: [],
         callers: [],
       },
@@ -1172,7 +1500,75 @@ test("giant-definition omitted count covers exactly the unshown top-level method
   assert.equal(shown, MEMBER_CAP);
   assert.match(formatted.text, new RegExp(`\\+${members.length - shown} methods omitted`));
   assert.equal(formatted.structuredContent.truncated, true);
-  assert.match(formatted.text, /graph one of the names above/);
+  assert.match(formatted.text, /continue once now/);
+  assert.match(formatted.text, /truncation\.retry/);
+});
+
+// The member list is a shared pool capped at MEMBER_CAP, so one giant entry's
+// members can push another's entirely into the "+N methods omitted" line. The
+// note must still tell the agent those entry points exist.
+test("a giant definition whose members are all omitted still points at them", () => {
+  const members = (path, base, count, callers) =>
+    Array.from({ length: count }, (_, index) => ({
+      name: `m${base + index}`,
+      path,
+      line: 10 + index * 10,
+      endLine: 18 + index * 10,
+      callerCount: callers - index,
+    }));
+  const formatted = formatMcpToolResult("graph", {
+    ...graphResult,
+    query: "AlphaClass BetaClass",
+    result: [
+      "**Exploration: AlphaClass BetaClass**",
+      "",
+      "Found 2 symbols across 2 files.",
+      "",
+      "**`src/a.ts`** — AlphaClass(class)",
+      "",
+      "**`src/b.ts`** — BetaClass(class)",
+      "",
+    ].join("\n"),
+    symbols: [
+      {
+        name: "AlphaClass",
+        kind: "class",
+        path: "src/a.ts",
+        startLine: 1,
+        endLine: 900,
+        callees: [],
+        callers: [],
+        members: members("src/a.ts", 0, MEMBER_CAP, 100),
+      },
+      {
+        name: "BetaClass",
+        kind: "class",
+        path: "src/b.ts",
+        startLine: 1,
+        endLine: 900,
+        callees: [],
+        callers: [],
+        members: members("src/b.ts", 100, 4, 1),
+      },
+    ],
+  });
+  const [alpha, beta] = formatted.structuredContent.entries;
+  assert.equal(alpha.spanCapped, true);
+  assert.equal(beta.spanCapped, true);
+  // AlphaClass filled the member pool; every BetaClass member is omitted.
+  assert.equal(
+    formatted.structuredContent.members.every(
+      (member) => member.path === "src/a.ts",
+    ),
+    true,
+  );
+  assert.match(formatted.text, /\+4 methods omitted/);
+  const notes = formatted.text.match(/body spans .+$/gm);
+  assert.match(notes[0], /use the entry points below/);
+  assert.match(
+    notes[1],
+    /its entry points are in the omitted methods below/,
+  );
 });
 
 // A long function has no methods to offer, so the note must not promise entry
@@ -1517,7 +1913,7 @@ test("grep formatter prints the daemon page instead of recapping at 16", () => {
     results: hits,
   });
   assert.equal(thirty.structuredContent.hits.length, 30);
-  assert.match(thirty.text, /grep token — 30 shown, more remain/);
+  assert.match(thirty.text, /grep token — 30\/\? shown, more remain/);
   assert.equal(thirty.text.includes("capped at"), false);
 
   const omitted = formatMcpToolResult("grep", {
@@ -1531,7 +1927,7 @@ test("grep formatter prints the daemon page instead of recapping at 16", () => {
     results: hits.slice(0, 16),
   });
   assert.equal(omitted.structuredContent.hits.length, 16);
-  assert.match(omitted.text, /grep token — 16 shown, more remain/);
+  assert.match(omitted.text, /grep token — 16\/\? shown, more remain/);
   assert.equal(omitted.text.includes("capped at"), false);
 
   const capped = formatMcpToolResult("grep", {
@@ -1550,7 +1946,8 @@ test("grep formatter prints the daemon page instead of recapping at 16", () => {
     })),
   });
   assert.equal(capped.structuredContent.hits.length, 48);
-  assert.match(capped.text, /capped at 48; more: cursor/);
+  assert.match(capped.text, /truncated — continue once now/);
+  assert.deepEqual(capped.structuredContent.truncation.retry, { cursor: "abc" });
   assert.equal(capped.text.includes("cursor=abc"), false);
 
   const ten = formatMcpToolResult("grep", {
@@ -1650,7 +2047,7 @@ test("find confirmation teaches not to find again and is not an error", () => {
     total: 1,
     results: [{ path: "docs/architecture/overview.md" }],
   });
-  assert.match(byExt.text, new RegExp(`^${FIND_CONFIRM}$`, "m"));
+  assert.match(byExt.text, new RegExp(escapeRegExp(FIND_CONFIRM), "m"));
   assert.equal(byExt.structuredContent.truncated, false);
   assert.equal(byExt.text.includes("isError"), false);
 
@@ -1661,7 +2058,7 @@ test("find confirmation teaches not to find again and is not an error", () => {
     total: 1,
     results: [{ path: "src/pkg/widget.py" }],
   });
-  assert.match(byBasename.text, new RegExp(`^${FIND_CONFIRM}$`, "m"));
+  assert.match(byBasename.text, new RegExp(escapeRegExp(FIND_CONFIRM), "m"));
 
   const fragment = formatMcpToolResult("find", {
     status: "ready",
@@ -1680,6 +2077,18 @@ test("find confirmation teaches not to find again and is not an error", () => {
     results: [],
   });
   assert.equal(miss.text.includes("do not find to confirm"), false);
+});
+
+test("find confirmation tells agents the path is ready for host Read", () => {
+  const hit = formatMcpToolResult("find", {
+    status: "ready",
+    root: "/repo",
+    query: "overview.md",
+    total: 1,
+    results: [{ path: "docs/architecture/overview.md" }],
+  });
+  assert.match(hit.text, /join to root for host Read/);
+  assert.match(MCP_INSTRUCTIONS, /find takes a path fragment or file name/);
 });
 
 test("empty tool menu and MCP instructions stop the locate loop", () => {

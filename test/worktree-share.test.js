@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 import {
   appendFileSync,
   existsSync,
@@ -7,6 +10,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -131,6 +135,44 @@ test("identical worktrees fingerprint the same, a changed one does not", async (
   assert.equal(await worktreeFingerprint(plain), null);
 });
 
+test("skip-worktree and assume-unchanged files shape the fingerprint", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "codeq-fp-flags-"));
+  const { wtA, wtB } = twins(parent);
+  const clean = await worktreeFingerprint(wtA);
+  assert.equal(await worktreeFingerprint(wtB), clean);
+
+  // skip-worktree hides edits from status, but the real bytes still decide
+  // whether one graph can answer for both trees.
+  git(wtB, "update-index", "--skip-worktree", "src/pkg/shared.py");
+  const cleanFlag = await worktreeFingerprint(wtB);
+  assert.notEqual(cleanFlag, clean, "the flag alone is content-relevant state");
+
+  appendFileSync(join(wtB, "src", "pkg", "shared.py"), "\n\ndef hidden():\n    return 8\n");
+  const dirtyFlag = await worktreeFingerprint(wtB);
+  assert.notEqual(dirtyFlag, cleanFlag, "flagged content must not pass for clean");
+  assert.notEqual(dirtyFlag, clean);
+
+  // Same flag, same bytes: the trees really are interchangeable.
+  git(wtA, "update-index", "--skip-worktree", "src/pkg/shared.py");
+  assert.equal(await worktreeFingerprint(wtA), cleanFlag);
+  git(wtB, "update-index", "--no-skip-worktree", "src/pkg/shared.py");
+  git(wtB, "checkout", "--", "src/pkg/shared.py");
+  git(wtB, "update-index", "--skip-worktree", "src/pkg/shared.py");
+  assert.equal(await worktreeFingerprint(wtB), cleanFlag);
+
+  // assume-unchanged is a different promise than skip-worktree, even when the
+  // file on disk still matches the index.
+  git(wtA, "update-index", "--no-skip-worktree", "src/pkg/shared.py");
+  git(wtA, "update-index", "--assume-unchanged", "src/pkg/shared.py");
+  const assumed = await worktreeFingerprint(wtA);
+  assert.notEqual(assumed, clean);
+  assert.notEqual(assumed, cleanFlag, "assume-unchanged is not skip-worktree");
+
+  // A dirty assume-unchanged file fingerprints by its own bytes too.
+  appendFileSync(join(wtA, "src", "pkg", "shared.py"), "\n\ndef hidden_two():\n    return 9\n");
+  assert.notEqual(await worktreeFingerprint(wtA), assumed);
+});
+
 test(
   "a second worktree with the same content reuses the first graph index",
   { timeout: 300_000 },
@@ -190,6 +232,229 @@ test(
     assert.equal(names(untouched.payload).includes("gamma_three"), false);
     const stillThere = cliJson(["graph", "alpha_one"], { cwd: wtA, env });
     assert.ok(names(stillThere.payload).includes("alpha_one"));
+  },
+);
+
+test(
+  "a follower that already owns an index drops it once the shared one answers",
+  { timeout: 300_000 },
+  (t) => {
+    const parent = mkdtempSync(join(tmpdir(), "codeq-follower-gc-"));
+    const dataDir = join(parent, "data");
+    const env = { ...process.env, CODEQ_DATA_DIR: dataDir };
+    delete env.CODEQ_CWD;
+    t.after(() => stopDaemon(dataDir));
+    const { wtA, wtB } = twins(parent);
+
+    // Both worktrees end up owning a database: wtB indexes while dirty (its
+    // fingerprint differs, so wtA cannot share it), wtA indexes clean.
+    appendFileSync(
+      join(wtB, "src", "pkg", "shared.py"),
+      "\n\ndef only_in_b():\n    return 9\n",
+    );
+    const own = cliJson(["graph", "alpha_one"], { cwd: wtB, env });
+    assert.equal(own.ok, true, own.stderr);
+    assert.equal(hasGraph(dataDir, wtB), true);
+    assert.equal(cliJson(["graph", "alpha_one"], { cwd: wtA, env }).ok, true);
+    assert.equal(hasGraph(dataDir, wtA), true);
+
+    // Content identical again: on the next fresh context wtB should attach to
+    // wtA's index, and its own database — built for content it no longer
+    // holds — becomes garbage to collect now, not at TTL.
+    git(wtB, "checkout", "--", "src/pkg/shared.py");
+    stopDaemon(dataDir);
+
+    const shared = cliJson(["graph", "alpha_one"], { cwd: wtB, env });
+    assert.equal(shared.ok, true, shared.stderr);
+    assert.equal(metadata(dataDir, wtB).sharedGraphRoot, wtA);
+    assert.equal(
+      hasGraph(dataDir, wtB),
+      false,
+      "once a shared index answers, the superseded own database is garbage",
+    );
+
+    // Nothing else in the bucket was touched: metadata still records the root.
+    assert.equal(metadata(dataDir, wtB).root, wtB);
+
+    // The share keeps answering after the deletion.
+    const again = cliJson(["graph", "beta_two"], { cwd: wtB, env });
+    assert.equal(again.ok, true, again.stderr);
+    assert.ok(names(again.payload).includes("beta_two"), JSON.stringify(again.payload));
+    assert.equal(hasGraph(dataDir, wtB), false);
+  },
+);
+
+test(
+  "an old own index survives while no shared index exists yet",
+  { timeout: 300_000 },
+  (t) => {
+    const parent = mkdtempSync(join(tmpdir(), "codeq-follower-ttl-"));
+    const dataDir = join(parent, "data");
+    const env = { ...process.env, CODEQ_DATA_DIR: dataDir };
+    delete env.CODEQ_CWD;
+    t.after(() => stopDaemon(dataDir));
+    const { wtB } = twins(parent);
+
+    // Baseline for the repro: with no source index anywhere, the worktree's
+    // own database is the only usable index and nothing may remove it — it
+    // stays until the TTL sweep, which is the behaviour this issue shortens
+    // only once a shared index proves usable.
+    assert.equal(cliJson(["graph", "alpha_one"], { cwd: wtB, env }).ok, true);
+    assert.equal(hasGraph(dataDir, wtB), true);
+    const again = cliJson(["graph", "beta_two"], { cwd: wtB, env });
+    assert.equal(again.ok, true, again.stderr);
+    assert.equal(hasGraph(dataDir, wtB), true);
+    assert.equal(metadata(dataDir, wtB).sharedGraphRoot, undefined);
+  },
+);
+
+test(
+  "a follower keeps its own index while the source cannot be opened",
+  { timeout: 300_000 },
+  (t) => {
+    const parent = mkdtempSync(join(tmpdir(), "codeq-follower-nosource-"));
+    const dataDir = join(parent, "data");
+    const env = { ...process.env, CODEQ_DATA_DIR: dataDir };
+    delete env.CODEQ_CWD;
+    t.after(() => stopDaemon(dataDir));
+    const { wtA, wtB } = twins(parent);
+
+    // wtB owns a database built while it was dirty, wtA owns the clean one;
+    // wtB is clean again so its next fresh context would share wtA's — except
+    // the source is gone: remove wtA's worktree and database between the
+    // daemon restarts, so no shared index can ever answer.
+    appendFileSync(
+      join(wtB, "src", "pkg", "shared.py"),
+      "\n\ndef only_in_b():\n    return 9\n",
+    );
+    assert.equal(cliJson(["graph", "alpha_one"], { cwd: wtB, env }).ok, true);
+    git(wtB, "checkout", "--", "src/pkg/shared.py");
+    assert.equal(cliJson(["graph", "alpha_one"], { cwd: wtA, env }).ok, true);
+    assert.equal(hasGraph(dataDir, wtB), true);
+    stopDaemon(dataDir);
+
+    rmSync(wtA, { recursive: true, force: true });
+    rmSync(rootBucket(dataDir, wtA).bucket, { recursive: true, force: true });
+
+    const still = cliJson(["graph", "alpha_one"], { cwd: wtB, env });
+    assert.equal(still.ok, true, still.stderr);
+    assert.ok(names(still.payload).includes("alpha_one"), JSON.stringify(still.payload));
+    assert.equal(
+      hasGraph(dataDir, wtB),
+      true,
+      "the only usable index must survive while no shared index answers",
+    );
+    assert.equal(metadata(dataDir, wtB).sharedGraphRoot, undefined);
+  },
+);
+
+function cliJsonAsync(args, { cwd, env, timeout = 120_000 }) {
+  return execFileAsync(process.execPath, [bin, "--json", ...args], {
+    cwd,
+    env,
+    encoding: "utf8",
+    timeout,
+    maxBuffer: 10 * 1024 * 1024,
+  }).then(
+    ({ stdout }) => ({ ok: true, payload: JSON.parse(stdout) }),
+    (error) => ({
+      ok: false,
+      stdout: error.stdout?.toString() || "",
+      stderr: error.stderr?.toString() || "",
+    }),
+  );
+}
+
+test(
+  "two worktrees cold-starting together converge on one shared index",
+  { timeout: 300_000 },
+  async (t) => {
+    const parent = mkdtempSync(join(tmpdir(), "codeq-share-race-"));
+    const dataDir = join(parent, "data");
+    const env = { ...process.env, CODEQ_DATA_DIR: dataDir };
+    delete env.CODEQ_CWD;
+    t.after(() => stopDaemon(dataDir));
+    const { wtA, wtB } = twins(parent);
+
+    // Fired in the same tick against a cold daemon: before the fix each root
+    // saw no published fingerprint and indexed its own full copy.
+    const [first, second] = await Promise.all([
+      cliJsonAsync(["graph", "alpha_one"], { cwd: wtA, env }),
+      cliJsonAsync(["graph", "alpha_one"], { cwd: wtB, env }),
+    ]);
+    assert.equal(first.ok, true, first.stderr);
+    assert.equal(second.ok, true, second.stderr);
+    assert.ok(names(first.payload).includes("alpha_one"), JSON.stringify(first.payload));
+    assert.ok(names(second.payload).includes("alpha_one"), JSON.stringify(second.payload));
+
+    const owners = [wtA, wtB].filter((root) => hasGraph(dataDir, root));
+    assert.equal(
+      owners.length,
+      1,
+      `exactly one worktree may own the index, got ${JSON.stringify(owners)}`,
+    );
+    const [owner] = owners;
+    const follower = owner === wtA ? wtB : wtA;
+    assert.equal(metadata(dataDir, follower).sharedGraphRoot, owner);
+    assert.equal(
+      metadata(dataDir, follower).graphFingerprint,
+      metadata(dataDir, owner).graphFingerprint,
+    );
+    assert.equal(metadata(dataDir, owner).sharedGraphRoot, undefined);
+  },
+);
+
+test(
+  "a follower converges on its own index when the claimed build fails",
+  { timeout: 300_000 },
+  async (t) => {
+    const parent = mkdtempSync(join(tmpdir(), "codeq-share-fail-"));
+    const dataDir = join(parent, "data");
+    const env = { ...process.env, CODEQ_DATA_DIR: dataDir };
+    delete env.CODEQ_CWD;
+    t.after(() => stopDaemon(dataDir));
+    const { wtA, wtB } = twins(parent);
+
+    // Poison wtA's database path so its worker can never finish indexing: the
+    // claim is still taken and released, but no fingerprint is ever published.
+    const doomed = rootBucket(dataDir, wtA).graphDir;
+    mkdirSync(join(doomed, "codegraph.db"), { recursive: true });
+
+    // wtA must be the one holding the claim when wtB arrives, so the follower
+    // exercises wait-then-rebuild instead of winning the claim itself. The
+    // winner's bucket lock appears only once it is inside the build.
+    const failedPromise = cliJsonAsync(["graph", "alpha_one"], {
+      cwd: wtA,
+      env,
+    });
+    const building = join(rootBucket(dataDir, wtA).bucket, "codegraph.lock");
+    const deadline = Date.now() + 120_000;
+    while (!existsSync(building)) {
+      if (Date.now() >= deadline) assert.fail("wtA never reached its build");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const survived = await cliJsonAsync(["graph", "alpha_one"], {
+      cwd: wtB,
+      env,
+    });
+    const failed = await failedPromise;
+    assert.equal(
+      failed.ok,
+      false,
+      "the poisoned root must fail rather than serve a half index",
+    );
+    assert.equal(survived.ok, true, survived.stderr);
+    assert.ok(
+      names(survived.payload).includes("alpha_one"),
+      JSON.stringify(survived.payload),
+    );
+    assert.equal(
+      hasGraph(dataDir, wtB),
+      true,
+      "with no shared source to reuse, the follower builds its own index",
+    );
+    assert.equal(metadata(dataDir, wtB).sharedGraphRoot, undefined);
+    assert.equal(metadata(dataDir, wtA).graphFingerprint, undefined);
   },
 );
 

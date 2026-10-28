@@ -41,6 +41,25 @@ function parseStatus(output) {
   return entries;
 }
 
+// `git ls-files -v` tags every index entry: "S" skip-worktree, lowercase
+// letters assume-unchanged (h is the common cached one). Both keep a path out
+// of `git status`, so the status pass above never sees them — a flagged file's
+// real bytes only enter the fingerprint through this list.
+function parseLsFiles(output) {
+  const entries = [];
+  for (const record of output.split("\0")) {
+    if (record.length < 3) continue;
+    const tag = record[0];
+    const path = record.slice(2);
+    if (tag === "S") {
+      entries.push({ flag: "skip-worktree", path });
+    } else if (tag === tag.toLowerCase() && tag !== tag.toUpperCase()) {
+      entries.push({ flag: "assume-unchanged", path });
+    }
+  }
+  return entries;
+}
+
 // The worktree bytes, not the index: a staged-only change still makes this tree
 // differ from HEAD, and codegraph indexes what is on disk.
 async function worktreeBlobs(root, paths) {
@@ -102,13 +121,20 @@ export async function worktreeFingerprint(root) {
       ]),
     );
     if (status.length > DIRTY_FILE_CAP) return null;
+    const flagged = parseLsFiles(await git(root, ["ls-files", "-v", "-z"]));
+    if (status.length + flagged.length > DIRTY_FILE_CAP) return null;
     const blobs = await worktreeBlobs(
       root,
-      status.map((entry) => entry.path),
+      status.map((entry) => entry.path).concat(flagged.map((entry) => entry.path)),
     );
     if (!blobs) return null;
     const dirty = status
       .map((entry) => `${entry.code}\t${blobs.get(entry.path)}\t${entry.path}`)
+      .concat(
+        flagged.map(
+          (entry) => `${entry.flag}\t${blobs.get(entry.path)}\t${entry.path}`,
+        ),
+      )
       .sort();
     const digest = createHash("sha256");
     digest.update(`${SCHEME}\n${commonDir}\n${head}\n${dirty.length}\n`);

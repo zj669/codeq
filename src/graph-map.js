@@ -6,9 +6,7 @@ import {
   GIANT_SPAN_LINES,
   MEMBER_CAP,
 } from "./limits.js";
-import { callerTier, isTestPath } from "./path-class.js";
-
-export { callerTier, isTestPath };
+import { callerTier } from "./path-class.js";
 
 const FILE_SECTION = /^\*\*`([^`]+)`\*\*(?:\s+—\s+(.*))?$/;
 const BLAST_LINE = /^- `([^`]+)`\s+\(([^()]+?):(\d+)\)\s+—\s+(.*)$/;
@@ -110,19 +108,29 @@ export function inPathScope(filePath, constraint) {
   return path === scope || path.startsWith(`${scope}/`);
 }
 
-export function queryIdentifiers(query) {
+// Question scaffolding is stripped so "how does render_widget work" resolves
+// render_widget, but the words themselves are also real symbol names across
+// languages — Python `class Path`, TS `class Into`, JS `function flow`, Go
+// `const Work`. queryIdentifierParts returns both tiers: primary drives the
+// explore-skip gate; secondary names still resolve so a bare "Path" or "who
+// calls Path" pins the symbol instead of answering with nothing.
+export function queryIdentifierParts(query) {
   const tokens = String(query || "").match(/[A-Za-z_][A-Za-z0-9_$]*/g) || [];
   const seen = new Set();
-  const identifiers = [];
+  const primary = [];
+  const secondary = [];
   for (const token of tokens) {
     if (token.length < 3) continue;
-    if (STOP_WORDS.has(token.toLowerCase())) continue;
     const key = token.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    identifiers.push(token);
+    (STOP_WORDS.has(key) ? secondary : primary).push(token);
   }
-  return identifiers;
+  return { primary, secondary };
+}
+
+export function queryIdentifiers(query) {
+  return queryIdentifierParts(query).primary;
 }
 
 function parseSymbols(suffix) {
@@ -386,9 +394,12 @@ function toEntry(span, hit = null) {
   };
 }
 
+// Extra same-name definitions compete for ENTRY_CAP slots, so they sort by the
+// same tier order as callers: a docs snippet or CI mention is never a better
+// definition than the production source the query asked about.
 function extraDefinitionRank(a, b) {
-  const test = Number(isTestPath(a.path)) - Number(isTestPath(b.path));
-  if (test) return test;
+  const tier = callerTier(a.path) - callerTier(b.path);
+  if (tier) return tier;
   const byKind = kindRank(a.kind) - kindRank(b.kind);
   if (byKind) return byKind;
   const byPath = String(a.path).localeCompare(String(b.path));
@@ -566,7 +577,10 @@ export function collectCallers(entries, cap = CALLER_CAP, constraint = null) {
 
 export function neighborhood(result) {
   const dump = parseExploreDump(result.result);
-  const identifiers = queryIdentifiers(result.query);
+  // Ranking wants every name-shaped token, secondary included: "who calls Path"
+  // pins Path from the blast radius even though Path reads as a stop word.
+  const parts = queryIdentifierParts(result.query);
+  const identifiers = [...parts.primary, ...parts.secondary];
   const resolved = resolveEntries(
     dump,
     identifiers,
@@ -606,6 +620,16 @@ export function neighborhood(result) {
   return {
     dump,
     identifiers,
+    // The miss line names the tokens the caller can grep: the primary set. A
+    // lone stop-word token was clearly meant as a name ("Path"), so it is
+    // worth a grep suggestion; an all-prose query ("how does this work") has
+    // no grep-able name at all and gets the generic hint instead.
+    identifiersShown:
+      parts.primary.length > 0
+        ? parts.primary
+        : parts.secondary.length === 1
+          ? parts.secondary
+          : [],
     hits: exactHits(dump, identifiers),
     entries,
     callees,

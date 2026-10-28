@@ -1,0 +1,302 @@
+[
+  {
+    "expected": "fastapi/applications.py",
+    "id": "find-01",
+    "query": "applications.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/routing.py",
+    "id": "find-02",
+    "query": "routing.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/responses.py",
+    "id": "find-03",
+    "query": "responses.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/requests.py",
+    "id": "find-04",
+    "query": "requests.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/params.py",
+    "id": "find-05",
+    "query": "params.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/param_functions.py",
+    "id": "find-06",
+    "query": "param_functions.py",
+    "tool": "find"
+  },
+  {
+    "expected": "tests/test_application.py",
+    "id": "find-07",
+    "query": "test_application.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/testclient.py",
+    "id": "find-08",
+    "query": "testclient.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/encoders.py",
+    "id": "find-09",
+    "query": "encoders.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/datastructures.py",
+    "id": "find-10",
+    "query": "datastructures.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/exception_handlers.py",
+    "id": "find-11",
+    "query": "exception_handlers.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/background.py",
+    "id": "find-12",
+    "query": "background.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/concurrency.py",
+    "id": "find-13",
+    "query": "concurrency.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/staticfiles.py",
+    "id": "find-14",
+    "query": "staticfiles.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/templating.py",
+    "id": "find-15",
+    "query": "templating.py",
+    "tool": "find"
+  },
+  {
+    "expected": "fastapi/routing.py",
+    "id": "grep-01",
+    "query": "class APIRouter",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/applications.py",
+    "id": "grep-02",
+    "query": "class FastAPI",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/exceptions.py",
+    "id": "grep-03",
+    "query": "class HTTPException",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/params.py",
+    "id": "grep-04",
+    "query": "class Depends",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/routing.py",
+    "id": "grep-05",
+    "query": "APIRouter",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/exceptions.py",
+    "id": "grep-06",
+    "query": "HTTPException",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/routing.py",
+    "id": "grep-07",
+    "query": "status_code",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/routing.py",
+    "id": "grep-08",
+    "query": "def get",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/background.py",
+    "id": "grep-09",
+    "query": "BackgroundTasks",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/testclient.py",
+    "id": "grep-10",
+    "query": "TestClient",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/params.py",
+    "id": "grep-11",
+    "query": "Query",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/requests.py",
+    "id": "grep-12",
+    "query": "Request",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/responses.py",
+    "id": "grep-13",
+    "query": "Response",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/routing.py",
+    "id": "grep-14",
+    "query": "include_router",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/applications.py",
+    "id": "grep-15",
+    "query": "add_middleware",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/applications.py",
+    "id": "grep-16",
+    "query": "on_event",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/websockets.py",
+    "id": "grep-17",
+    "query": "WebSocket",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/datastructures.py",
+    "id": "grep-18",
+    "query": "UploadFile",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/params.py",
+    "id": "grep-19",
+    "query": "Form",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/params.py",
+    "id": "grep-20",
+    "query": "Cookie",
+    "tool": "grep"
+  },
+  {
+    "expected": "fastapi/applications.py",
+    "id": "graph-01",
+    "query": "FastAPI",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/routing.py",
+    "id": "graph-02",
+    "query": "APIRouter",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/exceptions.py",
+    "id": "graph-03",
+    "query": "HTTPException",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/params.py",
+    "id": "graph-04",
+    "query": "Depends",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/applications.py",
+    "id": "graph-05",
+    "query": "how does FastAPI work",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/applications.py",
+    "id": "graph-06",
+    "query": "who calls APIRouter",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/routing.py",
+    "id": "graph-07",
+    "query": "where is APIRouter defined",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/responses.py",
+    "id": "graph-08",
+    "query": "UJSONResponse",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/background.py",
+    "id": "graph-09",
+    "query": "BackgroundTasks",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/params.py",
+    "id": "graph-10",
+    "query": "Path",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/responses.py",
+    "id": "graph-11",
+    "query": "ORJSONResponse",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/routing.py",
+    "id": "graph-12",
+    "query": "APIRoute",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/params.py",
+    "id": "graph-13",
+    "query": "Query",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/datastructures.py",
+    "id": "graph-14",
+    "query": "UploadFile",
+    "tool": "graph"
+  },
+  {
+    "expected": "fastapi/params.py",
+    "id": "graph-15",
+    "query": "File",
+    "tool": "graph"
+  }
+]
